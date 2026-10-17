@@ -202,14 +202,12 @@ func TestCollectAppendAndReplacement(t *testing.T) {
 	if err != nil || stats.Snapshots != 1 {
 		t.Fatalf("append stats=%#v err=%v", stats, err)
 	}
-	if err := os.Remove(path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path+".burn", []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	replaced := rolloutLine("2026-10-17T13:00:00Z", 77) + rolloutLine("2026-10-17T13:01:00Z", 78)
-	if err := os.WriteFile(path, []byte(replaced), 0o600); err != nil {
+	repl := path + ".repl"
+	if err := os.WriteFile(repl, []byte(replaced), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(repl, path); err != nil {
 		t.Fatal(err)
 	}
 	stats, err = c.Collect(context.Background(), st)

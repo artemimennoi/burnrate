@@ -212,13 +212,13 @@ func TestCursorStaleAppendAndRewrite(t *testing.T) {
 		t.Fatal("same-size rewrite was not detected")
 	}
 
-	if err := os.Remove(path); err != nil {
+	// Create the replacement while the original is still linked, then rename
+	// it into place. Unlink-then-create can reuse the inode on some runners.
+	repl := path + ".repl"
+	if err := os.WriteFile(repl, []byte("longer line\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path+".burn", []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte("longer line\n"), 0o600); err != nil {
+	if err := os.Rename(repl, path); err != nil {
 		t.Fatal(err)
 	}
 	replaced, err := os.Stat(path)
@@ -228,7 +228,7 @@ func TestCursorStaleAppendAndRewrite(t *testing.T) {
 	oldIno := info.Sys().(*syscall.Stat_t).Ino
 	newIno := replaced.Sys().(*syscall.Stat_t).Ino
 	if oldIno == newIno {
-		t.Fatal("could not allocate a new inode for the replacement")
+		t.Fatal("rename did not change the inode")
 	}
 	if !CursorStale(id, replaced, int64(len("a\n"))) {
 		t.Fatal("new inode was not detected")
