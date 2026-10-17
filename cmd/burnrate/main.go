@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/artemimennoi/burnrate/internal/agent"
@@ -52,19 +55,45 @@ func run(args []string) int {
 		fmt.Println("burnrate " + version)
 		return 0
 	case "agent":
-		return cmdAgent()
+		return cmdAgent(args[1:])
 	case "status":
-		return cmdReport(false)
+		return cmdReport(args[1:], false)
 	case "forecast":
-		return cmdReport(true)
+		return cmdReport(args[1:], true)
 	case "statusline":
-		return cmdStatusline()
+		return cmdStatusline(args[1:])
 	case "install":
-		return cmdInstall()
+		return cmdInstall(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", args[0], usageText)
 		return 2
 	}
+}
+
+// parseArgs rejects unknown flags and extra arguments. --help prints usage and
+// returns handled=true with code 0.
+func parseArgs(name string, args []string) (int, bool) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(os.Stdout, usageText)
+			return 0, true
+		}
+		fmt.Fprintf(os.Stderr, "burnrate: %s: %s\n", name, flagError(err))
+		return 2, true
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "burnrate: %s: unexpected argument %q\n%s", name, fs.Arg(0), usageText)
+		return 2, true
+	}
+	return 0, false
+}
+
+func flagError(err error) string {
+	msg := err.Error()
+	msg = strings.TrimPrefix(msg, "flag needs an argument: ")
+	return msg
 }
 
 func logger() *log.Logger {
@@ -93,7 +122,7 @@ func openApp() (config.Config, *store.Store, error) {
 	if err != nil {
 		return config.Config{}, nil, err
 	}
-	st, err := store.Open(path)
+	st, err := store.OpenOptions(path, store.Options{Retention: cfg.Retention()})
 	if err != nil {
 		return config.Config{}, nil, err
 	}
@@ -129,13 +158,20 @@ func newAgent(cfg config.Config, st *store.Store, withTelegram bool) (*agent.Age
 	return ag, nil
 }
 
-func cmdAgent() int {
+func cmdAgent(args []string) int {
+	if code, handled := parseArgs("agent", args); handled {
+		return code
+	}
 	cfg, st, err := openApp()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 		return 1
 	}
 	defer st.Close()
+	if _, err := cfg.AgentInterval(); err != nil {
+		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
+		return 1
+	}
 	ag, err := newAgent(cfg, st, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
@@ -150,7 +186,14 @@ func cmdAgent() int {
 	return 0
 }
 
-func cmdReport(forecast bool) int {
+func cmdReport(args []string, forecast bool) int {
+	name := "status"
+	if forecast {
+		name = "forecast"
+	}
+	if code, handled := parseArgs(name, args); handled {
+		return code
+	}
 	cfg, st, err := openApp()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
@@ -177,31 +220,41 @@ func cmdReport(forecast bool) int {
 	return 0
 }
 
-func cmdStatusline() int {
+func cmdStatusline(args []string) int {
+	if os.Getenv(claude.StatuslineDepthEnv) != "" {
+		return 0
+	}
+	if code, handled := parseArgs("statusline", args); handled {
+		return code
+	}
 	cfg, cfgPath, err := loadConfig()
+	command := ""
+	var save func(provider.Snapshot) error
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
-		// Still try to run the wrapped command if we can see one. Without a
-		// config there is no command, so stop.
-		return 1
-	}
-	config.WarnConfigPerms(cfgPath, os.Stderr)
-	var save func(provider.Snapshot) error
-	if path, err := cfg.ResolvedDBPath(); err != nil {
-		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
-	} else if st, err := store.OpenOptions(path, store.Options{BusyTimeout: store.StatuslineBusyTimeout}); err != nil {
-		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
+		command = config.RecoverStatuslineCommand(cfgPath)
+		if command == "" {
+			return 0
+		}
 	} else {
-		defer st.Close()
-		save = func(snap provider.Snapshot) error {
-			return st.SaveSnapshot(context.Background(), snap)
+		config.WarnConfigPerms(cfgPath, os.Stderr)
+		command = cfg.Claude.StatuslineCommand
+		if path, err := cfg.ResolvedDBPath(); err != nil {
+			fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
+		} else if st, err := store.OpenOptions(path, store.Options{BusyTimeout: store.StatuslineBusyTimeout, Retention: cfg.Retention()}); err != nil {
+			fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
+		} else {
+			defer st.Close()
+			save = func(snap provider.Snapshot) error {
+				return st.SaveSnapshot(context.Background(), snap)
+			}
 		}
 	}
 	err = claude.Run(claude.Options{
 		Stdin:   os.Stdin,
 		Stdout:  os.Stdout,
 		Stderr:  os.Stderr,
-		Command: cfg.Claude.StatuslineCommand,
+		Command: command,
 		Save:    save,
 	})
 	if err == nil {
@@ -215,7 +268,10 @@ func cmdStatusline() int {
 	return 1
 }
 
-func cmdInstall() int {
+func cmdInstall(args []string) int {
+	if code, handled := parseArgs("install", args); handled {
+		return code
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)

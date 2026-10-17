@@ -4,6 +4,7 @@ package agent
 import (
 	"context"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/artemimennoi/burnrate/internal/alert"
@@ -27,6 +28,8 @@ type Agent struct {
 	Interval   time.Duration
 	Now        func() time.Time
 	Log        *log.Logger
+	logMu      sync.Mutex
+	lastLog    time.Time
 }
 
 // Collectors builds the enabled collectors. Cursor and Grok stay disabled
@@ -72,6 +75,19 @@ func (a *Agent) logf(format string, args ...any) {
 	if a.Log != nil {
 		a.Log.Printf(format, args...)
 	}
+}
+
+func (a *Agent) logLimited(format string, args ...any) {
+	if a == nil || a.Log == nil {
+		return
+	}
+	a.logMu.Lock()
+	defer a.logMu.Unlock()
+	if !a.lastLog.IsZero() && time.Since(a.lastLog) < 30*time.Second {
+		return
+	}
+	a.lastLog = time.Now()
+	a.Log.Printf(format, args...)
 }
 
 func (a *Agent) views(ctx context.Context) ([]analysis.View, error) {
@@ -120,6 +136,11 @@ func (a *Agent) Scan(ctx context.Context) {
 
 // Tick scans local sources and sends any new threshold alerts.
 func (a *Agent) Tick(ctx context.Context) error {
+	if a.Store != nil {
+		if err := a.Store.Prune(ctx); err != nil {
+			a.logf("prune: %v", err)
+		}
+	}
 	a.Scan(ctx)
 	return a.alert(ctx)
 }
@@ -129,32 +150,70 @@ func (a *Agent) alert(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	budget := a.Interval
+	if budget <= 0 {
+		budget = 30 * time.Second
+	}
+	sendCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
 	waiting := 0
+	type job struct {
+		view    analysis.View
+		pending []int
+	}
+	var jobs []job
 	for _, v := range views {
 		sent, err := a.Store.SentThresholds(ctx, v.Series.Provider, v.Series.LimitID, v.Series.WindowKey, v.Series.ResetsAt)
 		if err != nil {
 			return err
 		}
 		pending := alert.Pending(v.Used, a.Thresholds, sent, v.Forecast.Kind == analysis.KindStale)
-		for _, th := range pending {
-			if a.Telegram == nil || a.ChatID == 0 {
-				waiting++
-				continue
-			}
-			text := analysis.FormatAlert(v, th, a.Location)
-			if err := a.Telegram.Send(ctx, a.ChatID, text); err != nil {
-				a.logf("telegram send failed: %v", err)
-				continue
-			}
-			if err := a.Store.MarkAlert(ctx, v.Series.Provider, v.Series.LimitID, v.Series.WindowKey, v.Series.ResetsAt, th, v.Used, a.now()); err != nil {
-				a.logf("record alert: %v", err)
-			}
+		if len(pending) == 0 {
+			continue
 		}
+		if a.Telegram == nil || a.ChatID == 0 {
+			waiting += len(pending)
+			continue
+		}
+		if !a.Telegram.AllowSend() {
+			a.logLimited("telegram send skipped during backoff")
+			continue
+		}
+		jobs = append(jobs, job{view: v, pending: pending})
 	}
+	var wg sync.WaitGroup
+	for _, j := range jobs {
+		wg.Add(1)
+		go func(j job) {
+			defer wg.Done()
+			a.deliver(sendCtx, j.view, j.pending)
+		}(j)
+	}
+	wg.Wait()
 	if waiting > 0 {
 		a.logf("telegram not configured; %d alerts pending", waiting)
 	}
 	return nil
+}
+
+func (a *Agent) deliver(ctx context.Context, v analysis.View, pending []int) {
+	th, ok := alert.Highest(pending)
+	if !ok {
+		return
+	}
+	text := analysis.FormatAlert(v, th, a.Location)
+	if err := a.Telegram.Send(ctx, a.ChatID, text); err != nil {
+		a.Telegram.NoteFailure()
+		a.logLimited("telegram send failed: %v", err)
+		return
+	}
+	a.Telegram.NoteSuccess()
+	for _, mark := range pending {
+		if err := a.Store.MarkAlert(ctx, v.Series.Provider, v.Series.LimitID, v.Series.WindowKey, v.Series.ResetsAt, mark, v.Used, a.now()); err != nil {
+			a.logf("record alert: %v", err)
+		}
+	}
 }
 
 // Run scans immediately, then on each interval, and long-polls Telegram until ctx ends.
@@ -163,8 +222,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	if a.Telegram != nil && a.ChatID != 0 {
 		a.logf("telegram enabled")
 		go func() {
-			bot := &telegram.Bot{Client: a.Telegram, ChatID: a.ChatID, Handler: a}
-			_ = bot.Run(ctx)
+			bot := &telegram.Bot{Client: a.Telegram, ChatID: a.ChatID, Handler: a, Log: a.Log}
+			if err := bot.Run(ctx); err != nil && ctx.Err() == nil {
+				a.logLimited("telegram bot: %v", err)
+			}
 		}()
 	} else {
 		a.logf("telegram disabled")

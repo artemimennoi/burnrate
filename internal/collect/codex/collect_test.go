@@ -229,6 +229,53 @@ func TestCollectAppendAndReplacement(t *testing.T) {
 	}
 }
 
+func TestCollectFinishedLineWithoutNewline(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "2026", "10", "17")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"timestamp":"2026-10-17T12:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","plan_type":"plus","primary":{"used_percent":40,"window_minutes":300,"resets_at":1792300000},"secondary":null}}}`
+	path := filepath.Join(dir, "rollout-done.jsonl")
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	col := New(root)
+	stats, err := col.Collect(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Snapshots != 0 {
+		t.Fatalf("first scan stored a partial line: %#v", stats)
+	}
+	stats, err = col.Collect(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Snapshots != 1 {
+		t.Fatalf("second scan = %#v", stats)
+	}
+	stats, err = col.Collect(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Snapshots != 0 {
+		t.Fatalf("third scan counted the line again: %#v", stats)
+	}
+	series, err := st.LatestSeries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != 1 || series[0].Samples[len(series[0].Samples)-1].Used != 40 {
+		t.Fatalf("series = %#v", series)
+	}
+}
+
 func TestCollectMissingDir(t *testing.T) {
 	stats, err := New(filepath.Join(t.TempDir(), "missing")).Collect(context.Background(), nil)
 	if err != nil || stats.Files != 0 {

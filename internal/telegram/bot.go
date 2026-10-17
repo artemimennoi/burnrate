@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,6 +37,10 @@ type Client struct {
 	BaseURL     string
 	HTTP        *http.Client
 	SendTimeout time.Duration
+
+	mu        sync.Mutex
+	backoff   time.Duration
+	failUntil time.Time
 }
 
 // Update is one getUpdates result.
@@ -52,6 +58,45 @@ type Message struct {
 // Chat identifies the conversation.
 type Chat struct {
 	ID int64 `json:"id"`
+}
+
+// AllowSend reports whether a previous failure's backoff has elapsed.
+func (c *Client) AllowSend() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failUntil.IsZero() || !time.Now().Before(c.failUntil)
+}
+
+// NoteFailure increases the send backoff. NoteSuccess clears it.
+func (c *Client) NoteFailure() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.backoff < time.Second {
+		c.backoff = time.Second
+	} else {
+		c.backoff *= 2
+	}
+	if c.backoff > 5*time.Minute {
+		c.backoff = 5 * time.Minute
+	}
+	c.failUntil = time.Now().Add(c.backoff)
+}
+
+// NoteSuccess clears the send backoff.
+func (c *Client) NoteSuccess() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.backoff = 0
+	c.failUntil = time.Time{}
 }
 
 func (c *Client) sendTimeout() time.Duration {
@@ -198,6 +243,7 @@ type Bot struct {
 	Client  *Client
 	ChatID  int64
 	Handler Handler
+	Log     *log.Logger
 }
 
 const helpText = "burnrate\n/status — current subscription windows\n/forecast — pace and when the limit will be hit"
@@ -253,9 +299,25 @@ func (b *Bot) Handle(ctx context.Context, u Update) error {
 	return b.Client.Send(ctx, b.ChatID, text)
 }
 
-// Run long-polls until ctx is cancelled.
+func (b *Bot) logLimited(last *time.Time, format string, args ...any) {
+	if b == nil || b.Log == nil {
+		return
+	}
+	if last != nil && !last.IsZero() && time.Since(*last) < 30*time.Second {
+		return
+	}
+	if last != nil {
+		*last = time.Now()
+	}
+	b.Log.Printf(format, args...)
+}
+
+// Run long-polls until ctx is cancelled. Transport errors use exponential
+// backoff and are logged without the bot token.
 func (b *Bot) Run(ctx context.Context) error {
 	var offset int64
+	backoff := time.Second
+	var lastLog time.Time
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -265,20 +327,26 @@ func (b *Bot) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			b.logLimited(&lastLog, "telegram getUpdates: %v", err)
+			timer := time.NewTimer(backoff)
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return nil
-			case <-time.After(2 * time.Second):
+			case <-timer.C:
+			}
+			if backoff < time.Minute {
+				backoff *= 2
 			}
 			continue
 		}
+		backoff = time.Second
 		for _, u := range updates {
 			if u.UpdateID >= offset {
 				offset = u.UpdateID + 1
 			}
 			if err := b.Handle(ctx, u); err != nil && ctx.Err() == nil {
-				// Keep polling. The next command can try again.
-				continue
+				b.logLimited(&lastLog, "telegram handle: %v", err)
 			}
 		}
 	}

@@ -86,3 +86,21 @@ func TestParseUsageFixtureDedupKey(t *testing.T) {
 		t.Fatalf("rest = %v %v", ids, outputs)
 	}
 }
+
+func TestParseStatuslinePercentBounds(t *testing.T) {
+	observed := time.Unix(0, 0).UTC()
+	high, err := ParseStatusline([]byte(`{"rate_limits":{"five_hour":{"used_percentage":100.4,"resets_at":1792300000}}}`), observed)
+	if err != nil || len(high.Windows) != 1 || high.Windows[0].UsedPercent != 100 {
+		t.Fatalf("clamp = %#v err %v", high.Windows, err)
+	}
+	low, err := ParseStatusline([]byte(`{"rate_limits":{"five_hour":{"used_percentage":-0.2,"resets_at":1792300000}}}`), observed)
+	if err != nil || len(low.Windows) != 1 || low.Windows[0].UsedPercent != 0 {
+		t.Fatalf("clamp low = %#v err %v", low.Windows, err)
+	}
+	for _, pct := range []string{"1e10", "-50"} {
+		snap, err := ParseStatusline([]byte(`{"rate_limits":{"five_hour":{"used_percentage":`+pct+`,"resets_at":1792300000}}}`), observed)
+		if err != nil || len(snap.Windows) != 0 {
+			t.Fatalf("%s windows = %#v err %v", pct, snap.Windows, err)
+		}
+	}
+}

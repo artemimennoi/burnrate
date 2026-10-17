@@ -16,15 +16,16 @@ import (
 
 // Config is the on-disk configuration plus environment overrides.
 type Config struct {
-	Timezone     string   `toml:"timezone"`
-	PollInterval string   `toml:"poll_interval"`
-	DBPath       string   `toml:"db_path"`
-	Claude       Claude   `toml:"claude"`
-	Codex        Codex    `toml:"codex"`
-	Cursor       Toggle   `toml:"cursor"`
-	Grok         Toggle   `toml:"grok"`
-	Telegram     Telegram `toml:"telegram"`
-	Alerts       Alerts   `toml:"alerts"`
+	Timezone      string   `toml:"timezone"`
+	PollInterval  string   `toml:"poll_interval"`
+	RetentionDays int      `toml:"retention_days"`
+	DBPath        string   `toml:"db_path"`
+	Claude        Claude   `toml:"claude"`
+	Codex         Codex    `toml:"codex"`
+	Cursor        Toggle   `toml:"cursor"`
+	Grok          Toggle   `toml:"grok"`
+	Telegram      Telegram `toml:"telegram"`
+	Alerts        Alerts   `toml:"alerts"`
 }
 
 // Claude configures the statusline wrapper and transcript token scan.
@@ -208,7 +209,7 @@ func applyEnv(cfg *Config) error {
 	if v, ok := os.LookupEnv("BURNRATE_TELEGRAM_CHAT_ID"); ok && strings.TrimSpace(v) != "" {
 		id, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 		if err != nil {
-			return fmt.Errorf("BURNRATE_TELEGRAM_CHAT_ID: %w", err)
+			return fmt.Errorf("BURNRATE_TELEGRAM_CHAT_ID must be an integer")
 		}
 		cfg.Telegram.ChatID = id
 	}
@@ -230,16 +231,83 @@ func (c Config) Location() (*time.Location, error) {
 	return loc, nil
 }
 
-// Interval parses poll_interval. The minimum is one second.
+// Interval parses poll_interval. Zero and other short values are allowed here;
+// the agent is the command that requires at least one second.
 func (c Config) Interval() (time.Duration, error) {
+	if strings.TrimSpace(c.PollInterval) == "" {
+		return 30 * time.Second, nil
+	}
 	d, err := time.ParseDuration(c.PollInterval)
 	if err != nil {
-		return 0, fmt.Errorf("poll_interval: %w", err)
+		return 0, fmt.Errorf("poll_interval is not a valid duration")
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("poll_interval must not be negative")
+	}
+	return d, nil
+}
+
+// AgentInterval is Interval plus the one-second minimum used by the agent.
+func (c Config) AgentInterval() (time.Duration, error) {
+	d, err := c.Interval()
+	if err != nil {
+		return 0, err
 	}
 	if d < time.Second {
 		return 0, fmt.Errorf("poll_interval must be at least 1s")
 	}
 	return d, nil
+}
+
+// Retention is how long snapshots are kept. Unset or non-positive uses 90 days.
+func (c Config) Retention() time.Duration {
+	days := c.RetentionDays
+	if days <= 0 {
+		days = 90
+	}
+	if days > 3650 {
+		days = 3650
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
+// RecoverStatuslineCommand reads a statusline_command assignment from a config
+// file even when the rest of the file does not parse.
+func RecoverStatuslineCommand(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "statusline_command") {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(line, "statusline_command"))
+		if !strings.HasPrefix(rest, "=") {
+			continue
+		}
+		return unquoteTOML(strings.TrimSpace(rest[1:]))
+	}
+	return ""
+}
+
+func unquoteTOML(v string) string {
+	if len(v) >= 2 {
+		if v[0] == '"' && v[len(v)-1] == '"' {
+			s, err := strconv.Unquote(v)
+			if err == nil {
+				return strings.TrimSpace(s)
+			}
+		}
+		if v[0] == '\'' && v[len(v)-1] == '\'' {
+			return strings.TrimSpace(v[1 : len(v)-1])
+		}
+	}
+	return strings.TrimSpace(v)
 }
 
 // TelegramConfigured reports whether alerts and the bot can run.

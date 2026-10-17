@@ -223,6 +223,58 @@ func (l lockedWriter) Write(p []byte) (int, error) {
 	return l.w.Write(p)
 }
 
+func TestStatuslineDepthStopsRecursion(t *testing.T) {
+	t.Setenv(StatuslineDepthEnv, "1")
+	marker := filepath.Join(t.TempDir(), "ran")
+	var stdout bytes.Buffer
+	saved := false
+	err := Run(Options{
+		Stdin:   bytes.NewReader([]byte(`{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1792300000}}}`)),
+		Stdout:  &stdout,
+		Stderr:  &stdout,
+		Command: "touch " + marker,
+		Save: func(provider.Snapshot) error {
+			saved = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 || saved {
+		t.Fatalf("nested statusline printed %q saved %v", stdout.String(), saved)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("nested command ran: %v", err)
+	}
+}
+
+func TestStatuslineCommandStillRunsWithTwoSpaces(t *testing.T) {
+	raw := []byte(`{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1792300000}}}`)
+	var stdout bytes.Buffer
+	saved := 0
+	err := Run(Options{
+		Stdin:   bytes.NewReader(raw),
+		Stdout:  &stdout,
+		Stderr:  io.Discard,
+		Command: `printf 'burnrate  statusline:%s' "$BURNRATE_STATUSLINE_DEPTH"`,
+		Now:     time.Unix(10, 0).UTC(),
+		Save: func(provider.Snapshot) error {
+			saved++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "burnrate  statusline:1" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if saved != 1 {
+		t.Fatalf("saved = %d", saved)
+	}
+}
+
 func TestCollectContinuesAfterUnreadable(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(root, 0o755); err != nil {

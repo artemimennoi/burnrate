@@ -152,7 +152,19 @@ func formatTime(t time.Time, loc *time.Location) string {
 	if loc == nil {
 		loc = time.UTC
 	}
-	return t.In(loc).Format("Mon 2 Jan 15:04 MST")
+	tt := t.In(loc)
+	if tt.Year() != time.Now().In(loc).Year() {
+		return tt.Format("Mon 2 Jan 2006 15:04 MST")
+	}
+	return tt.Format("Mon 2 Jan 15:04 MST")
+}
+
+// formatPace hides a pace that prints as -0.0 or 0.0 at one decimal place.
+func formatPace(p float64) float64 {
+	if math.Abs(p) < 0.05 {
+		return 0
+	}
+	return p
 }
 
 func forecastSentence(f Forecast, loc *time.Location) string {
@@ -162,14 +174,14 @@ func forecastSentence(f Forecast, loc *time.Location) string {
 	case KindReached:
 		return "Limit already reached."
 	case KindFlat:
-		if f.PacePerHour < 0 {
-			return fmt.Sprintf("Pace %.1f%%/h, usage is falling.", f.PacePerHour)
+		if f.PacePerHour < 0 && math.Abs(f.PacePerHour) >= 0.05 {
+			return fmt.Sprintf("Pace %.1f%%/h, usage is falling.", formatPace(f.PacePerHour))
 		}
 		return "Pace flat, no hit at the current pace."
 	case KindAfterReset:
-		return fmt.Sprintf("Pace %.1f%%/h, window resets before the limit.", f.PacePerHour)
+		return fmt.Sprintf("Pace %.1f%%/h, window resets before the limit.", formatPace(f.PacePerHour))
 	case KindHit:
-		return fmt.Sprintf("Pace %.1f%%/h, limit around %s.", f.PacePerHour, formatTime(f.HitAt, loc))
+		return fmt.Sprintf("Pace %.1f%%/h, limit around %s.", formatPace(f.PacePerHour), formatTime(f.HitAt, loc))
 	default:
 		return "Not enough samples to forecast."
 	}

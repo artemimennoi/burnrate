@@ -19,6 +19,7 @@ burnrate does **not** read OAuth tokens, API keys, or cookies, and it does **not
 git clone https://github.com/artemimennoi/burnrate.git
 cd burnrate
 make build          # bin/burnrate, CGO disabled
+mkdir -p "$HOME/bin"
 install -m 755 bin/burnrate "$HOME/bin/burnrate"
 ```
 
@@ -36,6 +37,8 @@ Install the background agent (launchd on macOS, a systemd user unit on Linux):
 ```bash
 burnrate install
 ```
+
+`burnrate install` writes the user service, enables it, and restarts it when it is already running (`systemctl --user restart` on Linux; `launchctl bootout`, then `bootstrap`, then `kickstart -k` on macOS). A configured Telegram token and chat id are written to `~/.config/burnrate/telegram.env` with mode 0600, or to `$XDG_CONFIG_HOME/burnrate/telegram.env` when that variable is set. The unit file does not contain the token. Running `burnrate install` again with no token removes that file.
 
 On Linux, if the service should keep running without a login session: `loginctl enable-linger "$USER"`. On macOS the plist is `~/Library/LaunchAgents/com.artemimennoi.burnrate.plist`.
 
@@ -70,7 +73,7 @@ Claude only includes `rate_limits` in the JSON it passes to the status line comm
 statusline_command = "~/.claude/statusline.sh"
 ```
 
-`burnrate statusline` reads stdin, stores the window snapshot, then runs `statusline_command` with the same bytes and prints its stdout. Leave the command empty to record and print nothing. Do not set the command to `burnrate statusline`.
+`burnrate statusline` starts `statusline_command` first, passing it the same stdin bytes, and prints that command's stdout. It records the window snapshot after the command has started, so the status line is not held behind the database write. Leave the command empty to record and print nothing. A nested `burnrate statusline`, including one reached through a wrapper script, records nothing and exits without printing. Do not set the command to `burnrate statusline`.
 
 The command needs to be on `PATH` for Claude, or use an absolute path in `settings.json`.
 
@@ -120,10 +123,10 @@ Cursor and Grok would be opt-in collectors behind the same `provider.Collector` 
 ## Development
 
 ```bash
-make ci     # go vet, go test, static build
+make ci     # go vet, go test, go test -race, static build
 ```
 
-GitHub Actions runs `go vet`, `go test`, and a CGO-disabled build for darwin/linux on amd64 and arm64.
+GitHub Actions runs `go vet`, `go test`, `go test -race` (CGO enabled for that job only), and a CGO-disabled build for darwin/linux on amd64 and arm64.
 
 ### Local fixture
 

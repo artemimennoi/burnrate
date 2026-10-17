@@ -25,6 +25,10 @@ func Sum(b []byte) string {
 // A complete line longer than maxLine is skipped and consumed.
 // If yield returns an error, the returned offset does not include that line.
 func ReadNewLines(path string, offset int64, yield func([]byte) error) (int64, error) {
+	return readLines(path, offset, false, yield)
+}
+
+func readLines(path string, offset int64, includePartial bool, yield func([]byte) error) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return offset, err
@@ -107,7 +111,19 @@ func ReadNewLines(path string, offset int64, yield func([]byte) error) (int64, e
 			}
 		}
 		if rerr == io.EOF {
-			// skipped and pending are an unfinished line. Leave them unconsumed.
+			if includePartial && len(pending) > 0 && !skipping && len(pending) <= maxLine {
+				owned := make([]byte, len(pending))
+				copy(owned, pending)
+				trimmed := bytes.TrimRight(owned, "\r\n")
+				if len(trimmed) > 0 {
+					if err := yield(trimmed); err != nil {
+						return pos, err
+					}
+				}
+				pos += int64(len(pending))
+				return pos, nil
+			}
+			// A growing file's unfinished line stays unconsumed.
 			return pos, nil
 		}
 		if rerr != nil {
@@ -125,8 +141,18 @@ func Tail(path string, offset int64, fileID string, yield func([]byte) error) (i
 	}
 	if CursorStale(fileID, info, offset) {
 		offset = 0
+		fileID = ""
 	}
-	newOffset, err := ReadNewLines(path, offset, yield)
+	// A file that has not changed since the last scan is done growing, so a
+	// final line without a newline is complete. A changed file keeps the
+	// partial unconsumed until a later scan sees it stay the same size.
+	stable := fileID != "" && fileID == FileID(info) && offset < info.Size()
+	var newOffset int64
+	if stable {
+		newOffset, err = readLines(path, offset, true, yield)
+	} else {
+		newOffset, err = readLines(path, offset, false, yield)
+	}
 	info2, serr := os.Stat(path)
 	if serr != nil {
 		return newOffset, fileID, err

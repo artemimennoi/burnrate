@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -77,9 +78,19 @@ CREATE INDEX idx_windows_reset ON snapshot_windows(window_key, resets_at);
 	migration3 = `
 ALTER TABLE cursors ADD COLUMN file_id TEXT NOT NULL DEFAULT '';
 `
+	migration4 = `
+CREATE INDEX idx_snapshots_observed ON snapshots(observed_at);
+CREATE INDEX idx_snapshots_provider_limit_time ON snapshots(provider, limit_id, observed_at);
+`
 )
 
-var migrations = []string{migration1, migration2, migration3}
+var migrations = []string{migration1, migration2, migration3, migration4}
+
+// DefaultRetention is how long snapshots and alerts are kept.
+const DefaultRetention = 90 * 24 * time.Hour
+
+// ResetSlack treats resets_at values this close as the same window.
+const ResetSlack = 120 * time.Second
 
 // StatuslineBusyTimeout is the SQLite busy wait for the statusline process.
 // A locked database drops the sample instead of holding up the user's command.
@@ -91,12 +102,16 @@ const defaultBusyTimeout = 5 * time.Second
 type Options struct {
 	// BusyTimeout is how long SQLite waits on a lock. Zero uses five seconds.
 	BusyTimeout time.Duration
+	// Retention drops snapshots and alerts older than this. Zero uses DefaultRetention.
+	// A negative value keeps every row.
+	Retention time.Duration
 }
 
 // Store is one process-local connection to the burnrate database.
 type Store struct {
-	db   *sql.DB
-	path string
+	db        *sql.DB
+	path      string
+	retention time.Duration
 }
 
 // Open creates parent directories, opens the database, and applies migrations.
@@ -106,31 +121,80 @@ func Open(path string) (*Store, error) {
 
 // OpenOptions is Open with a caller-chosen busy timeout.
 func OpenOptions(path string, opts Options) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := writableDB(path); err != nil {
 		return nil, err
 	}
 	busy := busyMillis(opts.BusyTimeout)
 	db, err := sql.Open("sqlite", sqliteDSN(path, busy))
 	if err != nil {
-		return nil, err
+		return nil, explainDB(path, err)
 	}
 	// More than one connection so a read can run while another statement is open.
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
 	if err := prepare(db, busy); err != nil {
 		db.Close()
-		return nil, err
+		return nil, explainDB(path, err)
 	}
-	s := &Store{db: db, path: path}
+	retention := opts.Retention
+	if retention == 0 {
+		retention = DefaultRetention
+	}
+	s := &Store{db: db, path: path, retention: retention}
 	if err := s.migrate(); err != nil {
 		db.Close()
-		return nil, err
+		return nil, explainDB(path, err)
 	}
 	if err := s.restrict(); err != nil {
 		db.Close()
 		return nil, err
 	}
+	if err := s.Prune(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+func writableDB(path string) error {
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return fmt.Errorf("database path %s is a directory", path)
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("database path %s: %w", path, err)
+	}
+	dir := filepath.Dir(path)
+	info, err := os.Stat(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("database directory %s: %w", dir, err)
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("cannot create database directory %s: %w", dir, err)
+		}
+		return nil
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("database directory %s is not a directory", dir)
+	}
+	probe := filepath.Join(dir, ".burnrate-write-probe")
+	f, err := os.OpenFile(probe, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("database directory %s is not writable: %w", dir, err)
+	}
+	f.Close()
+	os.Remove(probe)
+	return nil
+}
+
+func explainDB(path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "out of memory") || strings.Contains(msg, "(14)") {
+		return fmt.Errorf("cannot open database %s: path is not writable", path)
+	}
+	return err
 }
 
 func busyMillis(d time.Duration) int {
@@ -246,6 +310,8 @@ func (s *Store) Close() error {
 }
 
 // SaveSnapshot inserts a snapshot. A repeated origin is ignored.
+// resets_at values within ResetSlack of a stored window reuse that window.
+// A snapshot whose windows match the latest one is not stored again.
 func (s *Store) SaveSnapshot(ctx context.Context, snap provider.Snapshot) error {
 	if snap.Provider == "" || snap.Origin == "" || snap.ObservedAt.IsZero() || len(snap.Windows) == 0 {
 		return fmt.Errorf("incomplete snapshot")
@@ -255,6 +321,18 @@ func (s *Store) SaveSnapshot(ctx context.Context, snap provider.Snapshot) error 
 		return err
 	}
 	defer tx.Rollback()
+
+	windows, err := canonicalWindows(ctx, tx, snap.Provider, snap.LimitID, snap.Windows)
+	if err != nil {
+		return err
+	}
+	same, err := sameAsLatest(ctx, tx, snap.Provider, snap.LimitID, snap.PlanType, windows)
+	if err != nil {
+		return err
+	}
+	if same {
+		return nil
+	}
 
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO snapshots (provider, observed_at, limit_id, plan_type, source_key, origin)
@@ -281,7 +359,7 @@ func (s *Store) SaveSnapshot(ctx context.Context, snap provider.Snapshot) error 
 	if err != nil {
 		return err
 	}
-	for _, w := range snap.Windows {
+	for _, w := range windows {
 		if w.Key == "" || w.ResetsAt.IsZero() {
 			return fmt.Errorf("window %q missing key or reset time", w.Slot)
 		}
@@ -297,6 +375,109 @@ func (s *Store) SaveSnapshot(ctx context.Context, snap provider.Snapshot) error 
 		return err
 	}
 	return s.restrict()
+}
+
+func canonicalWindows(ctx context.Context, tx *sql.Tx, providerName, limitID string, windows []provider.Window) ([]provider.Window, error) {
+	out := make([]provider.Window, len(windows))
+	copy(out, windows)
+	slack := int64(ResetSlack / time.Second)
+	for i, w := range out {
+		if w.ResetsAt.IsZero() {
+			continue
+		}
+		var canon int64
+		err := tx.QueryRowContext(ctx, `
+			SELECT w.resets_at FROM snapshot_windows w
+			JOIN snapshots s ON s.id = w.snapshot_id
+			WHERE s.provider = ? AND s.limit_id = ? AND w.window_key = ?
+			  AND abs(w.resets_at - ?) <= ?
+			ORDER BY abs(w.resets_at - ?), w.resets_at
+			LIMIT 1`,
+			providerName, limitID, w.Key, w.ResetsAt.Unix(), slack, w.ResetsAt.Unix(),
+		).Scan(&canon)
+		if err == sql.ErrNoRows {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		out[i].ResetsAt = time.Unix(canon, 0).UTC()
+	}
+	return out, nil
+}
+
+func sameAsLatest(ctx context.Context, tx *sql.Tx, providerName, limitID, plan string, windows []provider.Window) (bool, error) {
+	var id int64
+	var gotPlan string
+	err := tx.QueryRowContext(ctx, `
+		SELECT id, plan_type FROM snapshots
+		WHERE provider = ? AND limit_id = ?
+		ORDER BY observed_at DESC, id DESC
+		LIMIT 1`, providerName, limitID).Scan(&id, &gotPlan)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if gotPlan != plan {
+		return false, nil
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT window_key, used_percent, window_minutes, resets_at
+		FROM snapshot_windows WHERE snapshot_id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	got := map[string]provider.Window{}
+	for rows.Next() {
+		var w provider.Window
+		var resets int64
+		if err := rows.Scan(&w.Key, &w.UsedPercent, &w.WindowMinutes, &resets); err != nil {
+			return false, err
+		}
+		w.ResetsAt = time.Unix(resets, 0).UTC()
+		got[w.Key] = w
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if len(got) != len(windows) {
+		return false, nil
+	}
+	for _, w := range windows {
+		prev, ok := got[w.Key]
+		if !ok || prev.WindowMinutes != w.WindowMinutes || prev.ResetsAt.Unix() != w.ResetsAt.Unix() {
+			return false, nil
+		}
+		if math.Abs(prev.UsedPercent-w.UsedPercent) > 1e-6 {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// Prune deletes snapshots and alerts older than the retention window.
+func (s *Store) Prune(ctx context.Context) error {
+	if s == nil || s.retention <= 0 {
+		return nil
+	}
+	cutoff := time.Now().Add(-s.retention).UnixMilli()
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM snapshots WHERE observed_at < ?`, cutoff); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM alerts WHERE sent_at < ?`, cutoff); err != nil {
+		return err
+	}
+	return s.restrict()
+}
+
+// CountSnapshots returns how many snapshot rows are stored.
+func (s *Store) CountSnapshots(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM snapshots`).Scan(&n)
+	return n, err
 }
 
 // SaveTokens upserts a usage row, keeping the larger output_tokens count.

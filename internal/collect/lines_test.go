@@ -235,6 +235,97 @@ func TestCursorStaleAppendAndRewrite(t *testing.T) {
 	}
 }
 
+func TestTailReadsStablePartialOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f.jsonl")
+	body := "full\npartial"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	off, id, err := Tail(path, 0, "", func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "full" {
+		t.Fatalf("first scan = %#v", got)
+	}
+	if off != int64(len("full\n")) || id == "" {
+		t.Fatalf("cursor = %d %q", off, id)
+	}
+
+	got = nil
+	off, id, err = Tail(path, off, id, func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "partial" {
+		t.Fatalf("second scan = %#v", got)
+	}
+	if off != int64(len(body)) {
+		t.Fatalf("offset = %d", off)
+	}
+
+	got = nil
+	off2, _, err := Tail(path, off, id, func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || off2 != off {
+		t.Fatalf("third scan = %#v offset %d -> %d", got, off, off2)
+	}
+}
+
+func TestTailAppendCompletesPartialOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f.jsonl")
+	if err := os.WriteFile(path, []byte("full\npartial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	off, id, err := Tail(path, 0, "", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(" more\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	var got []string
+	off, id, err = Tail(path, off, id, func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "partial more" {
+		t.Fatalf("resumed = %#v", got)
+	}
+
+	got = nil
+	if _, _, err := Tail(path, off, id, func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("counted again: %#v", got)
+	}
+}
+
 func TestSumStable(t *testing.T) {
 	if Sum([]byte("a")) == Sum([]byte("b")) {
 		t.Fatal("hash collision")

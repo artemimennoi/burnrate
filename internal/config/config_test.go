@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaultsWhenMissing(t *testing.T) {
@@ -140,8 +141,54 @@ func TestBadChatID(t *testing.T) {
 	t.Setenv("BURNRATE_TELEGRAM_CHAT_ID", "nope")
 	t.Setenv("BURNRATE_TELEGRAM_TOKEN", "")
 	t.Setenv("BURNRATE_TIMEZONE", "")
-	if _, err := Load(filepath.Join(t.TempDir(), "missing.toml")); err == nil {
+	_, err := Load(filepath.Join(t.TempDir(), "missing.toml"))
+	if err == nil {
 		t.Fatal("expected chat id error")
+	}
+	if strings.Contains(err.Error(), "nope") {
+		t.Fatalf("error echoed the env value: %v", err)
+	}
+}
+
+func TestIntervalZeroIsNotAnAgentInterval(t *testing.T) {
+	cfg := Config{PollInterval: "0s"}
+	d, err := cfg.Interval()
+	if err != nil || d != 0 {
+		t.Fatalf("interval = %s err %v", d, err)
+	}
+	if _, err := cfg.AgentInterval(); err == nil {
+		t.Fatal("agent accepted 0s")
+	}
+	cfg.PollInterval = "30s"
+	if _, err := cfg.AgentInterval(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.PollInterval = "-1s"
+	if _, err := cfg.Interval(); err == nil {
+		t.Fatal("negative interval accepted")
+	}
+}
+
+func TestRetentionDefault(t *testing.T) {
+	if got := (Config{}).Retention(); got != 90*24*time.Hour {
+		t.Fatalf("retention = %s", got)
+	}
+	if got := (Config{RetentionDays: 7}).Retention(); got != 7*24*time.Hour {
+		t.Fatalf("retention = %s", got)
+	}
+}
+
+func TestRecoverStatuslineCommand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad.toml")
+	body := "poll_interval = [\nstatusline_command = \"printf hi\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := RecoverStatuslineCommand(path); got != "printf hi" {
+		t.Fatalf("recovered = %q", got)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("broken config parsed")
 	}
 }
 

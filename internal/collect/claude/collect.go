@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/artemimennoi/burnrate/internal/collect"
@@ -124,6 +125,10 @@ func validJSON(line []byte) bool {
 	return json.Unmarshal(line, &v) == nil
 }
 
+// StatuslineDepthEnv is set on the wrapped command. A nested burnrate
+// statusline sees it, records nothing, and exits without printing.
+const StatuslineDepthEnv = "BURNRATE_STATUSLINE_DEPTH"
+
 // Options runs the statusline wrapper.
 type Options struct {
 	Stdin   io.Reader
@@ -139,12 +144,17 @@ type Options struct {
 // held behind the database write. Recording errors are written to stderr and
 // do not fail the command.
 func Run(opts Options) error {
+	if os.Getenv(StatuslineDepthEnv) != "" {
+		return nil
+	}
 	if opts.Stdout == nil {
 		opts.Stdout = io.Discard
 	}
 	if opts.Stderr == nil {
 		opts.Stderr = io.Discard
 	}
+	// The child process and recordStatusline both write stderr.
+	opts.Stderr = &syncWriter{w: opts.Stderr}
 	raw, err := io.ReadAll(opts.Stdin)
 	if err != nil {
 		return err
@@ -161,23 +171,43 @@ func Run(opts Options) error {
 	return waitErr
 }
 
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
 func startCommand(opts Options, raw []byte) (*exec.Cmd, error) {
 	command := strings.TrimSpace(opts.Command)
 	if command == "" {
-		return nil, nil
-	}
-	if strings.Contains(command, "burnrate statusline") {
-		fmt.Fprintln(opts.Stderr, "burnrate: statusline_command must not invoke burnrate statusline")
 		return nil, nil
 	}
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Stdin = bytes.NewReader(raw)
 	cmd.Stdout = opts.Stdout
 	cmd.Stderr = opts.Stderr
+	cmd.Env = withStatuslineDepth(os.Environ())
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
 	return cmd, nil
+}
+
+func withStatuslineDepth(env []string) []string {
+	prefix := StatuslineDepthEnv + "="
+	out := make([]string, 0, len(env)+1)
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return append(out, prefix+"1")
 }
 
 func recordStatusline(opts Options, raw []byte) {
