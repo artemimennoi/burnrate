@@ -1,0 +1,139 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/artemimennoi/burnrate/internal/collect/codex"
+	"github.com/artemimennoi/burnrate/internal/provider"
+	"github.com/artemimennoi/burnrate/internal/store"
+	"github.com/artemimennoi/burnrate/internal/telegram"
+)
+
+func TestTickAlertsAndDedup(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "SECRET_PATH_DO_NOT_STORE", "2026", "10", "17")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fiveReset := time.Date(2026, 10, 17, 16, 0, 0, 0, time.UTC).Unix()
+	weekReset := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC).Unix()
+	line := `{"timestamp":"2026-10-17T12:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","plan_type":"plus","primary":{"used_percent":92,"window_minutes":300,"resets_at":` + itoa(fiveReset) + `},"secondary":{"used_percent":10,"window_minutes":10080,"resets_at":` + itoa(weekReset) + `}}}}` + "\n"
+	line += `{"timestamp":"2026-10-17T12:01:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(root, "rollout-demo.jsonl"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var msg struct {
+			ChatID int64  `json:"chat_id"`
+			Text   string `json:"text"`
+		}
+		_ = json.Unmarshal(body, &msg)
+		if msg.ChatID != 42 {
+			t.Errorf("chat = %d", msg.ChatID)
+		}
+		mu.Lock()
+		sent = append(sent, msg.Text)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	var logs strings.Builder
+	ag := &Agent{
+		Collectors: []provider.Collector{codex.New(filepath.Dir(filepath.Dir(filepath.Dir(root))))},
+		Store:      st,
+		Telegram:   &telegram.Client{Token: "test-token", BaseURL: srv.URL, HTTP: srv.Client()},
+		ChatID:     42,
+		Thresholds: []int{50, 75, 90},
+		Location:   time.UTC,
+		Now:        func() time.Time { return time.Date(2026, 10, 17, 12, 30, 0, 0, time.UTC) },
+		Log:        log.New(&logs, "", 0),
+	}
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := append([]string(nil), sent...)
+	mu.Unlock()
+	if len(got) != 3 {
+		t.Fatalf("alerts = %#v\nlog=%s", got, logs.String())
+	}
+	for i, th := range []string{"alert 50%", "alert 75%", "alert 90%"} {
+		if !strings.Contains(got[i], th) || !strings.Contains(got[i], "Codex (plus) 5h is at 92.0%") {
+			t.Fatalf("alert %d = %s", i, got[i])
+		}
+		if strings.Contains(got[i], "SECRET_PATH_DO_NOT_STORE") || strings.Contains(got[i], "premium") {
+			t.Fatalf("alert leaked data: %s", got[i])
+		}
+	}
+	status, err := ag.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status, "92.0%") || strings.Contains(status, "SECRET_PATH") {
+		t.Fatalf("status = %s", status)
+	}
+	forecast, err := ag.Forecast(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(forecast, "Pace") {
+		t.Fatalf("forecast = %s", forecast)
+	}
+
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 3 {
+		t.Fatalf("dedup failed, sent %d: %#v", len(sent), sent)
+	}
+}
+
+func TestDisabledProviderIsLogged(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	var logs strings.Builder
+	ag := &Agent{
+		Collectors: []provider.Collector{provider.Disabled{ID: "cursor"}},
+		Store:      st,
+		Thresholds: []int{50, 75, 90},
+		Location:   time.UTC,
+		Log:        log.New(&logs, "", 0),
+	}
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "not implemented") {
+		t.Fatalf("log = %s", logs.String())
+	}
+}
+
+func itoa(n int64) string {
+	return strconv.FormatInt(n, 10)
+}

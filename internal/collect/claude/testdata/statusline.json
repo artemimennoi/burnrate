@@ -1,0 +1,9 @@
+{
+  "model": {"display_name": "Opus"},
+  "workspace": {"current_dir": "/SECRET_PATH_DO_NOT_STORE/project"},
+  "session_name": "SECRET_PROMPT_DO_NOT_STORE",
+  "rate_limits": {
+    "five_hour": {"used_percentage": 23.5, "resets_at": 1738425600},
+    "seven_day": {"used_percentage": 41.2, "resets_at": 1738857600}
+  }
+}

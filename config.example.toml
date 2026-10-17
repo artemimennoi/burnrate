@@ -1,0 +1,40 @@
+# burnrate configuration.
+# Copy to ~/.config/burnrate/config.toml and edit.
+# Put the bot token in this file or in the environment, never in git.
+
+# IANA timezone for reset times. Empty uses the system zone.
+timezone = "Europe/Minsk"
+
+# How often the agent reads local logs.
+poll_interval = "30s"
+
+# Empty uses ~/.local/share/burnrate/burnrate.db (or $XDG_DATA_HOME/burnrate).
+db_path = ""
+
+[claude]
+enabled = true
+# Empty uses ~/.claude/projects.
+projects_dir = ""
+# Previous status line command. Empty records the snapshot and prints nothing.
+# statusline_command = "~/.claude/statusline.sh"
+statusline_command = ""
+
+[codex]
+enabled = true
+# Empty uses ~/.codex/sessions.
+sessions_dir = ""
+
+# Phase 2. Unofficial APIs, off. Turning these on does not call the network.
+[cursor]
+enabled = false
+
+[grok]
+enabled = false
+
+[telegram]
+# Prefer BURNRATE_TELEGRAM_TOKEN and BURNRATE_TELEGRAM_CHAT_ID.
+token = ""
+chat_id = 0
+
+[alerts]
+thresholds = [50, 75, 90]
