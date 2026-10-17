@@ -147,16 +147,47 @@ func openWrite(path string, opts Options) (*Store, error) {
 	if err := writableDB(path); err != nil {
 		return nil, err
 	}
-	return openDB(path, opts, false)
+	return openDB(path, opts, false, false)
 }
 
 func openRead(path string, opts Options) (*Store, error) {
-	return openDB(path, opts, true)
+	// A WAL database needs to create -wal and -shm files beside itself. A
+	// directory that is not writable fails that open with SQLITE_READONLY_DIRECTORY.
+	// immutable=1 reads the main file without those sidecars.
+	immutable := !dirWritable(filepath.Dir(path))
+	s, err := openDB(path, opts, true, immutable)
+	if err != nil && !immutable && readonlyDirectory(err) {
+		return openDB(path, opts, true, true)
+	}
+	return s, err
 }
 
-func openDB(path string, opts Options, readOnly bool) (*Store, error) {
+func dirWritable(dir string) bool {
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0o200 == 0 {
+		return false
+	}
+	f, err := os.CreateTemp(dir, ".burnrate-write-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+	return true
+}
+
+func readonlyDirectory(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "readonly database") || strings.Contains(msg, "1544") || strings.Contains(msg, "READONLY_DIRECTORY")
+}
+
+func openDB(path string, opts Options, readOnly, immutable bool) (*Store, error) {
 	busy := busyMillis(opts.BusyTimeout)
-	db, err := sql.Open("sqlite", sqliteDSN(path, busy, readOnly))
+	db, err := sql.Open("sqlite", sqliteDSN(path, busy, readOnly, immutable))
 	if err != nil {
 		return nil, explainDB(path, err)
 	}
@@ -238,11 +269,15 @@ func busyMillis(d time.Duration) int {
 	return ms
 }
 
-func sqliteDSN(path string, busyMS int, readOnly bool) string {
+func sqliteDSN(path string, busyMS int, readOnly, immutable bool) string {
 	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
 	// RawQuery is copied as-is. Parentheses must stay literal for the driver.
 	if readOnly {
-		u.RawQuery = fmt.Sprintf("mode=ro&_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)", busyMS)
+		q := fmt.Sprintf("mode=ro&_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)", busyMS)
+		if immutable {
+			q = "immutable=1&" + q
+		}
+		u.RawQuery = q
 		return u.String()
 	}
 	u.RawQuery = fmt.Sprintf("_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", busyMS)
@@ -343,6 +378,24 @@ func execScript(tx *sql.Tx, script string) error {
 // Close closes the database.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// CanWrite reports whether a write transaction can start. status and forecast
+// use it so a locked database falls back to a read instead of failing.
+func (s *Store) CanWrite(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("nil store")
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `ROLLBACK`)
+	return err
 }
 
 // SaveSnapshot inserts a snapshot. A repeated origin is ignored.

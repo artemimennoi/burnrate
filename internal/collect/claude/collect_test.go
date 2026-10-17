@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -334,6 +336,177 @@ func dropEnv(env []string, names ...string) []string {
 	return out
 }
 
+func TestStatuslineLeavesBackgroundChildren(t *testing.T) {
+	for _, name := range []string{"background", "setsid"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			pidFile := filepath.Join(dir, "pid")
+			script := filepath.Join(dir, "run.sh")
+			var body string
+			if name == "background" {
+				body = "#!/bin/sh\nsleep 30 &\necho $! > " + strconv.Quote(pidFile) + "\necho FAST-OUTPUT\n"
+			} else {
+				body = "#!/bin/sh\nsetsid -f sh -c 'echo $$ > " + pidFile + "; exec sleep 30'\necho FAST-OUTPUT\n"
+			}
+			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			start := time.Now()
+			err := Run(Options{
+				Stdin:   bytes.NewReader([]byte(`{"session_id":"` + name + `"}`)),
+				Stdout:  &stdout,
+				Stderr:  &stderr,
+				Command: "sh " + strconv.Quote(script),
+			})
+			elapsed := time.Since(start)
+			if err != nil {
+				t.Fatalf("err %v after %s stderr %s", err, elapsed, stderr.String())
+			}
+			if elapsed > time.Second {
+				t.Fatalf("took %s stdout %q", elapsed, stdout.String())
+			}
+			if stdout.String() != "FAST-OUTPUT\n" {
+				t.Fatalf("stdout %q", stdout.String())
+			}
+			pidText, err := os.ReadFile(pidFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pid, err := strconv.Atoi(strings.TrimSpace(string(pidText)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+			if err := syscall.Kill(pid, 0); err != nil {
+				t.Fatalf("child %d is not alive: %v", pid, err)
+			}
+		})
+	}
+}
+
+func TestDepthCapExitsImmediately(t *testing.T) {
+	t.Setenv(StatuslineDepthEnv, "2")
+	marker := filepath.Join(t.TempDir(), "ran")
+	var stdout bytes.Buffer
+	err := Run(Options{
+		Stdin:   bytes.NewReader([]byte(`{"session_id":"depth-cap"}`)),
+		Stdout:  &stdout,
+		Stderr:  &stdout,
+		Command: "touch " + strconv.Quote(marker),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("printed %q", stdout.String())
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("command ran: %v", err)
+	}
+}
+
+func TestSessionLockStopsDetachedRecursion(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	raw := []byte(`{"session_id":"locked-session","rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1792300000}}}`)
+	bin := os.Args[0]
+	for _, variant := range []string{"direct", "background", "setsid", "nohup", "deep"} {
+		t.Run(variant, func(t *testing.T) {
+			dir := t.TempDir()
+			marker := filepath.Join(dir, "ran")
+			result := filepath.Join(dir, "result")
+			inPath := filepath.Join(dir, "in.json")
+			if err := os.WriteFile(inPath, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			inner := fmt.Sprintf("BURNRATE_LOCK_MODE=inner BURNRATE_LOCK_MARKER=%s BURNRATE_LOCK_RESULT=%s %s < %s",
+				strconv.Quote(marker), strconv.Quote(result), strconv.Quote(bin), strconv.Quote(inPath))
+			var body string
+			switch variant {
+			case "direct":
+				body = inner + "\n"
+			case "background":
+				body = "( " + inner + " & )\n"
+			case "setsid":
+				body = "setsid -f sh -c " + strconv.Quote(inner) + "\n"
+			case "nohup":
+				body = "nohup sh -c " + strconv.Quote(inner) + " >/dev/null 2>&1 &\n"
+			case "deep":
+				chain := filepath.Join(dir, "chain.sh")
+				chainBody := "#!/bin/sh\nif [ \"${BURNRATE_CHAIN:-0}\" -lt 16 ]; then\n  BURNRATE_CHAIN=$((${BURNRATE_CHAIN:-0}+1))\n  export BURNRATE_CHAIN\n  exec sh \"$0\"\nfi\n" + inner + "\n"
+				if err := os.WriteFile(chain, []byte(chainBody), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				body = "sh " + strconv.Quote(chain) + "\n"
+			}
+			body += "i=0\nwhile [ ! -f " + strconv.Quote(result) + " ] && [ \"$i\" -lt 80 ]; do\n  i=$((i+1))\n  sleep 0.05\ndone\n"
+			script := filepath.Join(dir, "outer.sh")
+			if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			err := Run(Options{
+				Stdin:   bytes.NewReader(raw),
+				Stdout:  &stdout,
+				Stderr:  &stderr,
+				Command: "sh " + strconv.Quote(script),
+			})
+			if err != nil {
+				t.Fatalf("err %v stdout %q stderr %q", err, stdout.String(), stderr.String())
+			}
+			got, err := os.ReadFile(result)
+			if err != nil {
+				t.Fatalf("no result: %v stdout %q stderr %q script:\n%s", err, stdout.String(), stderr.String(), body)
+			}
+			if string(got) != "blocked" {
+				t.Fatalf("result %q", got)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("nested command ran: %v", err)
+			}
+		})
+	}
+}
+
+func TestSessionLockAllowsAnotherSession(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	hold := filepath.Join(t.TempDir(), "hold")
+	other := filepath.Join(t.TempDir(), "other")
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_ = Run(Options{
+			Stdin:   bytes.NewReader([]byte(`{"session_id":"hold"}`)),
+			Stdout:  io.Discard,
+			Stderr:  io.Discard,
+			Command: "touch " + strconv.Quote(hold) + "; sleep 2",
+		})
+	}()
+	<-started
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(hold); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(hold); err != nil {
+		t.Fatal("holder did not start")
+	}
+	err := Run(Options{
+		Stdin:   bytes.NewReader([]byte(`{"session_id":"other"}`)),
+		Stdout:  io.Discard,
+		Stderr:  io.Discard,
+		Command: "touch " + strconv.Quote(other),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func init() {
 	if os.Getenv("BURNRATE_ANCESTOR_MODE") == "child" {
 		if StatuslineAncestor() {
@@ -343,6 +516,30 @@ func init() {
 		}
 		os.Exit(0)
 	}
+	if os.Getenv("BURNRATE_LOCK_MODE") == "inner" {
+		runLockInner()
+		os.Exit(0)
+	}
+}
+
+func runLockInner() {
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		os.WriteFile(os.Getenv("BURNRATE_LOCK_RESULT"), []byte("error"), 0o600)
+		return
+	}
+	marker := os.Getenv("BURNRATE_LOCK_MARKER")
+	_ = Run(Options{
+		Stdin:   bytes.NewReader(raw),
+		Stdout:  io.Discard,
+		Stderr:  io.Discard,
+		Command: "touch " + strconv.Quote(marker),
+	})
+	status := "blocked"
+	if _, err := os.Stat(marker); err == nil {
+		status = "ran"
+	}
+	_ = os.WriteFile(os.Getenv("BURNRATE_LOCK_RESULT"), []byte(status), 0o600)
 }
 
 func TestStatuslineCommandStillRunsWithTwoSpaces(t *testing.T) {

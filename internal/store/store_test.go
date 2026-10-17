@@ -539,6 +539,59 @@ func TestReadOnlyDoesNotBlockOnWriter(t *testing.T) {
 	}
 }
 
+func TestReadOnlyImmutableWithoutWALSidecars(t *testing.T) {
+	srcPath := filepath.Join(t.TempDir(), "src.db")
+	src, err := Open(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Now().UTC().Truncate(time.Millisecond)
+	if err := src.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "codex", ObservedAt: observed, LimitID: "codex", PlanType: "plus", Origin: "immutable",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "primary", UsedPercent: 62, WindowMinutes: 300, ResetsAt: observed.Add(time.Hour),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	src.Close()
+
+	dir := filepath.Join(t.TempDir(), "ro")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "burnrate.db")
+	body, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(dest + "-wal")
+	os.Remove(dest + "-shm")
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	ro, err := OpenOptions(dest, Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	n, err := ro.CountSnapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("snapshots = %d", n)
+	}
+}
+
 func TestRejectEmptySnapshot(t *testing.T) {
 	s := openTest(t)
 	err := s.SaveSnapshot(context.Background(), provider.Snapshot{Provider: "codex"})

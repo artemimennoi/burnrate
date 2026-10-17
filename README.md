@@ -32,7 +32,7 @@ cp config.example.toml ~/.config/burnrate/config.toml
 
 The database defaults to `~/.local/share/burnrate/burnrate.db` (`$XDG_DATA_HOME` when that is set). Reset times use the timezone in the config. An empty timezone uses the system zone. The example config sets `Europe/Minsk`.
 
-`retention_days` is how long snapshots and alert records are kept. Unset means 90 days. The agent deletes older rows about once an hour. `status` and `forecast` only read the database, so they do not prune and they do not take a write lock. Consecutive snapshots with the same window values update that row's last-seen time instead of inserting another row, and the pace uses that time.
+`retention_days` is how long snapshots and alert records are kept. Unset means 90 days. The agent deletes older rows about once an hour. `status` and `forecast` scan local logs and may write snapshots, using a short lock wait. If the database is locked they print the rows already saved and say so on stderr. They do not prune. Consecutive snapshots with the same window values update that row's last-seen time instead of inserting another row, and the pace uses that time.
 
 Install the background agent (launchd on macOS, a systemd user unit on Linux):
 
@@ -51,7 +51,7 @@ burnrate status
 burnrate forecast
 ```
 
-Both commands print the windows already recorded. `burnrate agent` scans local logs on a timer (default 30s), updates last-seen times, prunes old rows, sends alerts, and answers the bot.
+Both commands scan local logs, then print. `burnrate agent` scans on a timer (default 30s), updates last-seen times, prunes old rows, sends alerts, and answers the bot.
 
 ## Status line wrapper
 
@@ -75,7 +75,7 @@ Claude only includes `rate_limits` in the JSON it passes to the status line comm
 statusline_command = "~/.claude/statusline.sh"
 ```
 
-`burnrate statusline` starts `statusline_command` first, passing it the same stdin bytes, and prints that command's stdout. It records the window snapshot after the command has started, so the status line is not held behind the database write. A database lock is waited on only briefly and does not stop the wrapped command. The command is stopped if it runs longer than 5 seconds. Leave the command empty to record and print nothing. A nested `burnrate statusline`, including one reached through a wrapper script or `env -u`, records nothing and exits without printing. `BURNRATE_STATUSLINE_DEPTH` in your own shell does not turn the command off. Do not set the command to `burnrate statusline`.
+`burnrate statusline` starts `statusline_command` first, passing it the same stdin bytes, and prints that command's stdout. It records the window snapshot after the command has started, so the status line is not held behind the database write. A database lock is waited on only briefly and does not stop the wrapped command. The command is stopped if it is still running after 5 seconds. A background or detached process it already started is left running. Leave the command empty to record and print nothing. A nested `burnrate statusline` with the same session, including one reached through a wrapper, `env -u`, or `setsid`, records the sample and exits without printing or running the wrapped command again. `BURNRATE_STATUSLINE_DEPTH` in your own shell does not turn the command off. Do not set the command to `burnrate statusline`.
 
 The command needs to be on `PATH` for Claude, or use an absolute path in `settings.json`.
 

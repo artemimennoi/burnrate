@@ -194,6 +194,13 @@ func TestRecoverStatuslineCommand(t *testing.T) {
 	if got := RecoverStatuslineCommand(outside); got != "" {
 		t.Fatalf("outside [claude] recovered %q", got)
 	}
+	spaced := filepath.Join(t.TempDir(), "spaced.toml")
+	if err := os.WriteFile(spaced, []byte("poll_interval = [\n[ claude ] # c\nstatusline_command = \"printf spaced\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := RecoverStatuslineCommand(spaced); got != "printf spaced" {
+		t.Fatalf("spaced header recovered %q", got)
+	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("broken config parsed")
 	}

@@ -281,7 +281,7 @@ func RecoverStatuslineCommand(path string) string {
 	}
 	section := ""
 	for _, line := range strings.Split(string(b), "\n") {
-		line = strings.TrimSpace(line)
+		line = stripTOMLComment(strings.TrimSpace(line))
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -302,6 +302,30 @@ func RecoverStatuslineCommand(path string) string {
 		return unquoteTOML(strings.TrimSpace(rest[1:]))
 	}
 	return ""
+}
+
+// stripTOMLComment removes a trailing # comment that is outside quotes.
+// Section headers such as `[ claude ] # c` stay parseable.
+func stripTOMLComment(line string) string {
+	inSingle := false
+	inDouble := false
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '#':
+			if !inSingle && !inDouble {
+				return strings.TrimSpace(line[:i])
+			}
+		}
+	}
+	return strings.TrimSpace(line)
 }
 
 func unquoteTOML(v string) string {

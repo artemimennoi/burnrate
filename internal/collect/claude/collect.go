@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -131,9 +133,13 @@ func validJSON(line []byte) bool {
 // detected by walking parent processes.
 const StatuslineDepthEnv = "BURNRATE_STATUSLINE_DEPTH"
 
-// statuslineTimeout bounds the wrapped command. The process group is killed
-// when it expires so a stuck script cannot hold the status line open.
+// statuslineTimeout bounds the main wrapped process. On expiry only that
+// process group is killed. A normal exit does not kill background children.
 var statuslineTimeout = 5 * time.Second
+
+// statuslineWaitDelay is how long Wait keeps reading pipes after the main
+// process exits. Background children may still hold those pipes.
+var statuslineWaitDelay = 100 * time.Millisecond
 
 // Options runs the statusline wrapper.
 type Options struct {
@@ -153,20 +159,28 @@ func Run(opts Options) error {
 	if opts.Stderr == nil {
 		opts.Stderr = io.Discard
 	}
-	if StatuslineAncestor() {
-		return nil
-	}
-	WarnIgnoredDepth(opts.Stderr)
 	if opts.Stdout == nil {
 		opts.Stdout = io.Discard
 	}
-	// The child process and recordStatusline both write stderr.
-	opts.Stderr = &syncWriter{w: opts.Stderr}
+	if StatuslineAncestor() || DepthAtLeast(2) {
+		return nil
+	}
+	WarnIgnoredDepth(opts.Stderr)
 	raw, err := io.ReadAll(opts.Stdin)
 	if err != nil {
 		return err
 	}
-	cmd, startErr := startCommand(opts, raw)
+	acquired, release := acquireSessionLock(raw)
+	defer release()
+	if !acquired {
+		// Same stdin is already running a statusline. Record this sample and
+		// do not start another wrapped command.
+		recordStatusline(opts, raw)
+		return nil
+	}
+	cmd, stderr, cleanup, startErr := startCommand(opts, raw)
+	defer cleanup()
+	opts.Stderr = stderr
 	recordStatusline(opts, raw)
 	if cmd == nil {
 		return startErr
@@ -176,6 +190,19 @@ func Run(opts Options) error {
 		return startErr
 	}
 	return waitErr
+}
+
+// DepthAtLeast reports whether BURNRATE_STATUSLINE_DEPTH is an integer >= n.
+func DepthAtLeast(n int) bool {
+	v, ok := os.LookupEnv(StatuslineDepthEnv)
+	if !ok {
+		return false
+	}
+	got, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return false
+	}
+	return got >= n
 }
 
 // WarnIgnoredDepth prints one line when BURNRATE_STATUSLINE_DEPTH is set on a
@@ -197,12 +224,22 @@ func waitCommand(cmd *exec.Cmd) error {
 	defer timer.Stop()
 	select {
 	case err := <-done:
-		return err
+		return ignoreWaitDelay(cmd, err)
 	case <-timer.C:
 		killGroup(cmd)
 		<-done
 		return fmt.Errorf("statusline command timed out")
 	}
+}
+
+func ignoreWaitDelay(cmd *exec.Cmd, err error) error {
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		return err
+	}
+	if cmd != nil && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		return nil
+	}
+	return err
 }
 
 func killGroup(cmd *exec.Cmd) {
@@ -224,25 +261,69 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	return s.w.Write(p)
 }
 
-func startCommand(opts Options, raw []byte) (*exec.Cmd, error) {
+func startCommand(opts Options, raw []byte) (*exec.Cmd, io.Writer, func(), error) {
+	noop := func() {}
 	command := strings.TrimSpace(opts.Command)
 	if command == "" {
-		return nil, nil
+		return nil, opts.Stderr, noop, nil
 	}
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Stdin = bytes.NewReader(raw)
 	cmd.Stdout = opts.Stdout
-	cmd.Stderr = opts.Stderr
 	cmd.Env = withStatuslineDepth(os.Environ())
+	cmd.WaitDelay = statuslineWaitDelay
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	child, record, cleanup := setupStderr(opts.Stderr)
+	cmd.Stderr = child
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		cleanup()
+		return nil, opts.Stderr, noop, err
 	}
-	return cmd, nil
+	return cmd, record, cleanup, nil
+}
+
+// setupStderr gives the child an *os.File. A real stderr file is passed
+// through, so Wait does not sit on a pipe that a background child inherited.
+// Any other writer is fed from a pipe that is closed once the caller finishes
+// waiting for the main process.
+func setupStderr(dst io.Writer) (child io.Writer, record io.Writer, cleanup func()) {
+	noop := func() {}
+	if f, ok := dst.(*os.File); ok {
+		return f, f, noop
+	}
+	if dst == nil {
+		dst = io.Discard
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		locked := &syncWriter{w: dst}
+		return locked, locked, noop
+	}
+	locked := &syncWriter{w: dst}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(locked, r)
+	}()
+	var once sync.Once
+	cleanup = func() {
+		once.Do(func() {
+			_ = w.Close()
+			_ = r.Close()
+			<-done
+		})
+	}
+	return w, locked, cleanup
 }
 
 func withStatuslineDepth(env []string) []string {
 	prefix := StatuslineDepthEnv + "="
+	n := 0
+	if v, ok := os.LookupEnv(StatuslineDepthEnv); ok {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
 	out := make([]string, 0, len(env)+1)
 	for _, e := range env {
 		if strings.HasPrefix(e, prefix) {
@@ -250,7 +331,7 @@ func withStatuslineDepth(env []string) []string {
 		}
 		out = append(out, e)
 	}
-	return append(out, prefix+"1")
+	return append(out, prefix+strconv.Itoa(n+1))
 }
 
 func recordStatusline(opts Options, raw []byte) {

@@ -168,18 +168,49 @@ func TestReportsAndStatuslineSurviveLockedDB(t *testing.T) {
 
 	start := time.Now()
 	code, stdout, stderr := withStdio(t, "", func() int { return run([]string{"status"}) })
-	if code != 0 || strings.Contains(stderr, "locked") || time.Since(start) > time.Second {
+	if code != 0 || !strings.Contains(stderr, "database is locked; showing saved data") || time.Since(start) > time.Second {
 		t.Fatalf("status code %d after %s stdout %q stderr %q", code, time.Since(start), stdout, stderr)
 	}
 	start = time.Now()
 	code, stdout, stderr = withStdio(t, "", func() int { return run([]string{"forecast"}) })
-	if code != 0 || strings.Contains(stderr, "locked") || time.Since(start) > time.Second {
+	if code != 0 || !strings.Contains(stderr, "database is locked; showing saved data") || time.Since(start) > time.Second {
 		t.Fatalf("forecast code %d after %s stdout %q stderr %q", code, time.Since(start), stdout, stderr)
 	}
 	start = time.Now()
 	code, stdout, stderr = withStdio(t, `{"rate_limits":{}}`, func() int { return run([]string{"statusline"}) })
 	if code != 0 || stdout != "hi" || time.Since(start) > time.Second {
 		t.Fatalf("statusline code %d after %s stdout %q stderr %q", code, time.Since(start), stdout, stderr)
+	}
+}
+
+func TestStatusScansCodexLogs(t *testing.T) {
+	quietEnv(t)
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "burnrate.db")
+	sessions := filepath.Join(root, "sessions", "2026", "10", "17")
+	if err := os.MkdirAll(sessions, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"timestamp":"2026-09-24T10:00:00.000Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":62.0,"window_minutes":300,"resets_at":1790000000},"secondary":null,"plan_type":"plus"}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(sessions, "rollout-demo.jsonl"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(root, "config.toml")
+	body := "db_path = " + strconv.Quote(dbPath) + "\n[claude]\nenabled = false\n[codex]\nenabled = true\nsessions_dir = " + strconv.Quote(filepath.Join(root, "sessions")) + "\n"
+	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BURNRATE_CONFIG", cfg)
+	code, stdout, stderr := withStdio(t, "", func() int { return run([]string{"status"}) })
+	if code != 0 {
+		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "62.0%") {
+		t.Fatalf("status did not scan the rollout: %s", stdout)
+	}
+	code, stdout, stderr = withStdio(t, "", func() int { return run([]string{"forecast"}) })
+	if code != 0 || !strings.Contains(stdout, "62.0%") {
+		t.Fatalf("forecast code %d stdout %s stderr %s", code, stdout, stderr)
 	}
 }
 

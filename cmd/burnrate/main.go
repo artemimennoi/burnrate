@@ -194,16 +194,54 @@ func cmdReport(args []string, forecast bool) int {
 	if code, handled := parseArgs(name, args); handled {
 		return code
 	}
-	cfg, st, err := openApp(true)
+	cfg, cfgPath, err := loadConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 		return 1
+	}
+	config.WarnConfigPerms(cfgPath, os.Stderr)
+	path, err := cfg.ResolvedDBPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
+		return 1
+	}
+	// Scan through a short-timeout write connection. Prune stays in the agent.
+	// A locked database falls back to the rows already stored.
+	locked := false
+	doScan := false
+	st, err := store.OpenOptions(path, store.Options{BusyTimeout: store.StatuslineBusyTimeout, Retention: cfg.Retention()})
+	if err == nil {
+		if werr := st.CanWrite(context.Background()); werr != nil {
+			st.Close()
+			st = nil
+			locked = dbLocked(werr)
+		} else {
+			doScan = true
+		}
+	} else {
+		locked = dbLocked(err)
+	}
+	if !doScan {
+		if st != nil {
+			st.Close()
+		}
+		st, err = store.OpenOptions(path, store.Options{ReadOnly: true, BusyTimeout: store.StatuslineBusyTimeout, Retention: cfg.Retention()})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
+			return 1
+		}
 	}
 	defer st.Close()
 	ag, err := newAgent(cfg, st, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 		return 1
+	}
+	if locked {
+		fmt.Fprintf(os.Stderr, "burnrate: database is locked; showing saved data\n")
+	}
+	if doScan {
+		ag.Scan(context.Background())
 	}
 	var text string
 	if forecast {
@@ -219,8 +257,16 @@ func cmdReport(args []string, forecast bool) int {
 	return 0
 }
 
+func dbLocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "sqlite_busy") || strings.Contains(msg, "database is busy")
+}
+
 func cmdStatusline(args []string) int {
-	if claude.StatuslineAncestor() {
+	if claude.StatuslineAncestor() || claude.DepthAtLeast(2) {
 		return 0
 	}
 	if code, handled := parseArgs("statusline", args); handled {
