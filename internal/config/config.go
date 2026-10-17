@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -110,6 +111,38 @@ func DefaultCodexSessions() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, ".codex", "sessions"), nil
+}
+
+// WarnConfigPerms writes a warning when path is group- or world-readable and
+// the file itself contains a non-empty telegram token. A token that exists
+// only in the environment does not warn. The config file is not modified.
+func WarnConfigPerms(path string, w io.Writer) {
+	if w == nil || path == "" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	if info.Mode().Perm()&0o077 == 0 {
+		return
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var probe struct {
+		Telegram struct {
+			Token string `toml:"token"`
+		} `toml:"telegram"`
+	}
+	if err := toml.Unmarshal(b, &probe); err != nil {
+		return
+	}
+	if strings.TrimSpace(probe.Telegram.Token) == "" {
+		return
+	}
+	fmt.Fprintf(w, "burnrate: config %s is readable by group or others and contains a Telegram token; chmod 600 is safer\n", path)
 }
 
 // Load reads path. A missing default path yields defaults. A missing

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestCommand(t *testing.T) {
@@ -88,5 +90,58 @@ func TestHandleAllowedChatOnly(t *testing.T) {
 		if strings.Contains(text, "secret-token") {
 			t.Fatal("reply contains the bot token")
 		}
+	}
+}
+
+func TestSendRedactsTokenAndURL(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	token := "123456:SUPERSECRET"
+	c := &Client{Token: token, BaseURL: "http://" + addr, SendTimeout: 50 * time.Millisecond}
+	err = c.Send(context.Background(), 1, "hi")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, token) || strings.Contains(msg, "http://") || strings.Contains(msg, addr) {
+		t.Fatalf("transport error leaked token or url: %s", msg)
+	}
+}
+
+func TestSendTimeoutDoesNotCapLongPoll(t *testing.T) {
+	token := "123456:SUPERSECRET"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "sendMessage") {
+			time.Sleep(300 * time.Millisecond)
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": []any{}})
+	}))
+	defer srv.Close()
+	c := &Client{Token: token, BaseURL: srv.URL, SendTimeout: 50 * time.Millisecond}
+	start := time.Now()
+	err := c.Send(context.Background(), 1, "hi")
+	if time.Since(start) > time.Second {
+		t.Fatalf("send took %s", time.Since(start))
+	}
+	if err == nil || strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "http") {
+		t.Fatalf("err = %v", err)
+	}
+	start = time.Now()
+	ups, err := c.GetUpdates(context.Background(), 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ups) != 0 {
+		t.Fatalf("updates = %#v", ups)
+	}
+	if time.Since(start) < 150*time.Millisecond {
+		t.Fatalf("getUpdates returned too fast: %s", time.Since(start))
 	}
 }

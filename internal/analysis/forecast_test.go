@@ -97,6 +97,26 @@ func TestForecastIgnoresTinySpan(t *testing.T) {
 	}
 }
 
+func TestForecastTinyPaceDoesNotOverflow(t *testing.T) {
+	start := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
+	end := start.Add(7 * 24 * time.Hour)
+	resets := end.Add(24 * time.Hour)
+	view := Evaluate(provider.Series{
+		Provider: "claude", LimitID: "subscription", WindowKey: "7d",
+		WindowMinutes: 10080, ResetsAt: resets,
+		Samples: []provider.Sample{
+			{At: start, Used: 10},
+			{At: end, Used: 10.001},
+		},
+	}, end)
+	if view.Forecast.Kind != KindAfterReset {
+		t.Fatalf("kind = %v hit %s pace %v", view.Forecast.Kind, view.Forecast.HitAt, view.Forecast.PacePerHour)
+	}
+	if !view.Forecast.HitAt.IsZero() && (view.Forecast.HitAt.Year() < 2026 || !view.Forecast.HitAt.Before(resets)) {
+		t.Fatalf("hit = %s", view.Forecast.HitAt)
+	}
+}
+
 func TestForecastReachedAndStale(t *testing.T) {
 	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 	reached := Evaluate(provider.Series{

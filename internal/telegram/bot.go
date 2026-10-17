@@ -6,12 +6,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
+
+const defaultSendTimeout = 15 * time.Second
+
+var httpURL = regexp.MustCompile(`https?://[^\s"]+`)
 
 // Handler answers bot commands from local data.
 type Handler interface {
@@ -20,10 +27,14 @@ type Handler interface {
 }
 
 // Client talks to the Telegram Bot API.
+// SendTimeout bounds sendMessage. Zero uses defaultSendTimeout.
+// GetUpdates uses the long-poll timeout instead, so a slow poll is not cut
+// short by the send deadline.
 type Client struct {
-	Token   string
-	BaseURL string
-	HTTP    *http.Client
+	Token       string
+	BaseURL     string
+	HTTP        *http.Client
+	SendTimeout time.Duration
 }
 
 // Update is one getUpdates result.
@@ -43,11 +54,11 @@ type Chat struct {
 	ID int64 `json:"id"`
 }
 
-func (c *Client) client() *http.Client {
-	if c != nil && c.HTTP != nil {
-		return c.HTTP
+func (c *Client) sendTimeout() time.Duration {
+	if c != nil && c.SendTimeout > 0 {
+		return c.SendTimeout
 	}
-	return http.DefaultClient
+	return defaultSendTimeout
 }
 
 func (c *Client) endpoint(method string) string {
@@ -58,30 +69,55 @@ func (c *Client) endpoint(method string) string {
 	return base + "/bot" + c.Token + "/" + method
 }
 
-func (c *Client) do(ctx context.Context, method string, body any, out any) error {
+// redact strips the bot token and any URL. Transport errors from net/http
+// include the request URL, and that URL contains the token.
+func (c *Client) redact(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.Err != nil {
+		// url.Error prints the full request URL, which contains the bot token.
+		msg = uerr.Op + ": " + uerr.Err.Error()
+		if parsed, perr := url.Parse(uerr.URL); perr == nil && parsed.Host != "" {
+			msg = strings.ReplaceAll(msg, parsed.Host, "[redacted-url]")
+		}
+	}
+	if c != nil && c.Token != "" {
+		msg = strings.ReplaceAll(msg, c.Token, "[redacted]")
+	}
+	msg = httpURL.ReplaceAllString(msg, "[redacted-url]")
+	if msg == err.Error() {
+		return err
+	}
+	return errors.New(msg)
+}
+
+func (c *Client) do(ctx context.Context, client *http.Client, method string, body any, out any) error {
 	var buf bytes.Buffer
 	if err := json.NewEncoder(&buf).Encode(body); err != nil {
-		return err
+		return c.redact(err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(method), &buf)
 	if err != nil {
-		return err
+		return c.redact(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.client().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return c.redact(err)
 	}
 	defer resp.Body.Close()
 	payload, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return err
+		return c.redact(err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("telegram %s: http %d", method, resp.StatusCode)
+		return c.redact(fmt.Errorf("telegram %s: http %d", method, resp.StatusCode))
 	}
 	if err := json.Unmarshal(payload, out); err != nil {
-		return err
+		return c.redact(err)
 	}
 	return nil
 }
@@ -98,7 +134,14 @@ func (c *Client) Send(ctx context.Context, chatID int64, text string) error {
 		OK          bool   `json:"ok"`
 		Description string `json:"description"`
 	}
-	err := c.do(ctx, "sendMessage", map[string]any{
+	timeout := c.sendTimeout()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	client := c.HTTP
+	if client == nil {
+		client = &http.Client{Timeout: timeout}
+	}
+	err := c.do(ctx, client, "sendMessage", map[string]any{
 		"chat_id":                  chatID,
 		"text":                     text,
 		"disable_web_page_preview": true,
@@ -110,7 +153,7 @@ func (c *Client) Send(ctx context.Context, chatID int64, text string) error {
 		if resp.Description == "" {
 			resp.Description = "not ok"
 		}
-		return fmt.Errorf("telegram sendMessage: %s", resp.Description)
+		return c.redact(fmt.Errorf("telegram sendMessage: %s", resp.Description))
 	}
 	return nil
 }
@@ -122,7 +165,19 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout int) ([]U
 		Description string   `json:"description"`
 		Result      []Update `json:"result"`
 	}
-	err := c.do(ctx, "getUpdates", map[string]any{
+	if timeout < 0 {
+		timeout = 0
+	}
+	// The Bot API holds the request open for timeout seconds. The send
+	// deadline must not apply here.
+	wait := time.Duration(timeout)*time.Second + 10*time.Second
+	ctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	client := c.HTTP
+	if client == nil {
+		client = &http.Client{Timeout: wait}
+	}
+	err := c.do(ctx, client, "getUpdates", map[string]any{
 		"offset":  offset,
 		"timeout": timeout,
 	}, &resp)
@@ -133,7 +188,7 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout int) ([]U
 		if resp.Description == "" {
 			resp.Description = "not ok"
 		}
-		return nil, fmt.Errorf("telegram getUpdates: %s", resp.Description)
+		return nil, c.redact(fmt.Errorf("telegram getUpdates: %s", resp.Description))
 	}
 	return resp.Result, nil
 }

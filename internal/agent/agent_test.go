@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -131,6 +132,55 @@ func TestDisabledProviderIsLogged(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "not implemented") {
 		t.Fatalf("log = %s", logs.String())
+	}
+}
+
+func TestAlertLogRedactsTelegramToken(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	token := "999:TELEGRAMTOKENSECRET"
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	resets := time.Date(2026, 10, 17, 18, 0, 0, 0, time.UTC)
+	if err := st.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "codex", ObservedAt: resets.Add(-time.Hour), LimitID: "codex", PlanType: "plus",
+		Origin: "origin", SourceKey: "src",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "primary", UsedPercent: 92, WindowMinutes: 300, ResetsAt: resets,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	ag := &Agent{
+		Store: st,
+		Telegram: &telegram.Client{
+			Token:       token,
+			BaseURL:     "http://" + addr,
+			SendTimeout: 200 * time.Millisecond,
+		},
+		ChatID:     7,
+		Thresholds: []int{50, 75, 90},
+		Location:   time.UTC,
+		Now:        func() time.Time { return resets.Add(-time.Hour) },
+		Log:        log.New(&logs, "", 0),
+	}
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	text := logs.String()
+	if strings.Contains(text, token) || strings.Contains(text, addr) || strings.Contains(text, "http://") {
+		t.Fatalf("log leaked token or url: %s", text)
+	}
+	if !strings.Contains(text, "telegram send failed") {
+		t.Fatalf("log = %s", text)
 	}
 }
 

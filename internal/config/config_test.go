@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -141,5 +142,43 @@ func TestBadChatID(t *testing.T) {
 	t.Setenv("BURNRATE_TIMEZONE", "")
 	if _, err := Load(filepath.Join(t.TempDir(), "missing.toml")); err == nil {
 		t.Fatal("expected chat id error")
+	}
+}
+
+func TestWarnConfigPerms(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte("timezone = \"UTC\"\n[telegram]\ntoken = \"sekrit\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	WarnConfigPerms(path, &b)
+	if b.Len() == 0 {
+		t.Fatal("expected a permission warning")
+	}
+	if strings.Contains(b.String(), "sekrit") {
+		t.Fatalf("warning included the token: %s", b.String())
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b.Reset()
+	WarnConfigPerms(path, &b)
+	if b.Len() != 0 {
+		t.Fatalf("private file warned: %s", b.String())
+	}
+	if err := os.WriteFile(path, []byte("[telegram]\ntoken = \"\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	WarnConfigPerms(path, &b)
+	if b.Len() != 0 {
+		t.Fatalf("empty token warned: %s", b.String())
+	}
+	if err := os.WriteFile(path, []byte("timezone = \"UTC\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	WarnConfigPerms(path, &b)
+	if b.Len() != 0 {
+		t.Fatalf("tokenless file warned: %s", b.String())
 	}
 }

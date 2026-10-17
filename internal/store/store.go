@@ -74,55 +74,108 @@ CREATE TABLE alerts (
 CREATE INDEX idx_snapshots_provider_time ON snapshots(provider, observed_at);
 CREATE INDEX idx_windows_reset ON snapshot_windows(window_key, resets_at);
 `
+	migration3 = `
+ALTER TABLE cursors ADD COLUMN file_id TEXT NOT NULL DEFAULT '';
+`
 )
 
-var migrations = []string{migration1, migration2}
+var migrations = []string{migration1, migration2, migration3}
+
+// StatuslineBusyTimeout is the SQLite busy wait for the statusline process.
+// A locked database drops the sample instead of holding up the user's command.
+const StatuslineBusyTimeout = 50 * time.Millisecond
+
+const defaultBusyTimeout = 5 * time.Second
+
+// Options controls a database connection.
+type Options struct {
+	// BusyTimeout is how long SQLite waits on a lock. Zero uses five seconds.
+	BusyTimeout time.Duration
+}
 
 // Store is one process-local connection to the burnrate database.
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
 }
 
 // Open creates parent directories, opens the database, and applies migrations.
 func Open(path string) (*Store, error) {
+	return OpenOptions(path, Options{})
+}
+
+// OpenOptions is Open with a caller-chosen busy timeout.
+func OpenOptions(path string, opts Options) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", sqliteDSN(path))
+	busy := busyMillis(opts.BusyTimeout)
+	db, err := sql.Open("sqlite", sqliteDSN(path, busy))
 	if err != nil {
 		return nil, err
 	}
 	// More than one connection so a read can run while another statement is open.
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	if err := prepare(db); err != nil {
+	if err := prepare(db, busy); err != nil {
 		db.Close()
 		return nil, err
 	}
-	s := &Store{db: db}
+	s := &Store{db: db, path: path}
 	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := s.restrict(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-func sqliteDSN(path string) string {
+func busyMillis(d time.Duration) int {
+	if d <= 0 {
+		d = defaultBusyTimeout
+	}
+	ms := int(d / time.Millisecond)
+	if ms < 1 {
+		ms = 1
+	}
+	return ms
+}
+
+func sqliteDSN(path string, busyMS int) string {
 	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
 	// RawQuery is copied as-is. Parentheses must stay literal for the driver.
-	u.RawQuery = "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	u.RawQuery = fmt.Sprintf("_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", busyMS)
 	return u.String()
 }
 
-func prepare(db *sql.DB) error {
+func prepare(db *sql.DB, busyMS int) error {
 	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
 		return fmt.Errorf("journal_mode: %w", err)
 	}
-	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA busy_timeout = %d", busyMS)); err != nil {
 		return fmt.Errorf("busy_timeout: %w", err)
 	}
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
 		return fmt.Errorf("foreign_keys: %w", err)
+	}
+	return nil
+}
+
+// restrict keeps the database and its WAL sidecars private to the user.
+func (s *Store) restrict() error {
+	for _, p := range []string{s.path, s.path + "-wal", s.path + "-shm"} {
+		if _, err := os.Stat(p); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return err
+		}
+		if err := os.Chmod(p, 0o600); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -240,7 +293,10 @@ func (s *Store) SaveSnapshot(ctx context.Context, snap provider.Snapshot) error 
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.restrict()
 }
 
 // SaveTokens upserts a usage row, keeping the larger output_tokens count.
@@ -258,10 +314,22 @@ func (s *Store) SaveTokens(ctx context.Context, usage provider.TokenUsage) error
 			input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(provider, message_id) DO UPDATE SET
-			model = excluded.model,
-			input_tokens = excluded.input_tokens,
-			cache_creation_tokens = excluded.cache_creation_tokens,
-			cache_read_tokens = excluded.cache_read_tokens,
+			model = CASE
+				WHEN excluded.output_tokens >= token_usage.output_tokens THEN excluded.model
+				ELSE token_usage.model
+			END,
+			input_tokens = CASE
+				WHEN excluded.output_tokens >= token_usage.output_tokens THEN excluded.input_tokens
+				ELSE token_usage.input_tokens
+			END,
+			cache_creation_tokens = CASE
+				WHEN excluded.output_tokens >= token_usage.output_tokens THEN excluded.cache_creation_tokens
+				ELSE token_usage.cache_creation_tokens
+			END,
+			cache_read_tokens = CASE
+				WHEN excluded.output_tokens >= token_usage.output_tokens THEN excluded.cache_read_tokens
+				ELSE token_usage.cache_read_tokens
+			END,
 			output_tokens = CASE
 				WHEN excluded.output_tokens > token_usage.output_tokens THEN excluded.output_tokens
 				ELSE token_usage.output_tokens
@@ -279,7 +347,10 @@ func (s *Store) SaveTokens(ctx context.Context, usage provider.TokenUsage) error
 		usage.CacheCreationInputTokens,
 		usage.CacheReadInputTokens,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.restrict()
 }
 
 // Usage returns one stored token row.
@@ -308,27 +379,34 @@ func (s *Store) CountTokens(ctx context.Context) (int, error) {
 	return n, err
 }
 
-// Cursor returns the byte offset for a source, or 0 when none is stored.
-func (s *Store) Cursor(ctx context.Context, providerName, sourceKey string) (int64, error) {
+// Cursor returns the byte offset and file identity for a source.
+// A missing row is offset 0 and an empty file id.
+func (s *Store) Cursor(ctx context.Context, providerName, sourceKey string) (int64, string, error) {
 	var off int64
+	var fileID string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT byte_offset FROM cursors WHERE provider = ? AND source_key = ?`,
+		SELECT byte_offset, file_id FROM cursors WHERE provider = ? AND source_key = ?`,
 		providerName, sourceKey,
-	).Scan(&off)
+	).Scan(&off, &fileID)
 	if err == sql.ErrNoRows {
-		return 0, nil
+		return 0, "", nil
 	}
-	return off, err
+	return off, fileID, err
 }
 
-// SetCursor records a byte offset.
-func (s *Store) SetCursor(ctx context.Context, providerName, sourceKey string, offset int64) error {
+// SetCursor records a byte offset and the file identity it belongs to.
+func (s *Store) SetCursor(ctx context.Context, providerName, sourceKey string, offset int64, fileID string) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO cursors (provider, source_key, byte_offset) VALUES (?, ?, ?)
-		ON CONFLICT(provider, source_key) DO UPDATE SET byte_offset = excluded.byte_offset`,
-		providerName, sourceKey, offset,
+		INSERT INTO cursors (provider, source_key, byte_offset, file_id) VALUES (?, ?, ?, ?)
+		ON CONFLICT(provider, source_key) DO UPDATE SET
+			byte_offset = excluded.byte_offset,
+			file_id = excluded.file_id`,
+		providerName, sourceKey, offset, fileID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.restrict()
 }
 
 // LatestSeries returns one series per provider, limit, and window key.

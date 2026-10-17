@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -29,7 +31,7 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
+	if n != 3 {
 		t.Fatalf("versions = %d", n)
 	}
 	s.Close()
@@ -41,7 +43,7 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 2 {
+	if n != 3 {
 		t.Fatalf("versions after reopen = %d", n)
 	}
 }
@@ -104,45 +106,63 @@ func TestTokensKeepMaxOutput(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
 	early := provider.TokenUsage{
-		Provider: "claude", MessageID: "msg_1", Model: "claude-opus",
+		Provider: "claude", MessageID: "msg_1", Model: "partial",
 		ObservedAt:  time.Date(2026, 4, 8, 13, 10, 57, 0, time.UTC),
-		InputTokens: 5, OutputTokens: 3, CacheCreationInputTokens: 100, CacheReadInputTokens: 50,
+		InputTokens: 1, OutputTokens: 3, CacheCreationInputTokens: 2, CacheReadInputTokens: 3,
 	}
-	late := early
-	late.OutputTokens = 120
-	late.ObservedAt = early.ObservedAt.Add(time.Second)
+	late := provider.TokenUsage{
+		Provider: "claude", MessageID: "msg_1", Model: "full",
+		ObservedAt:  early.ObservedAt.Add(time.Second),
+		InputTokens: 50, OutputTokens: 120, CacheCreationInputTokens: 100, CacheReadInputTokens: 80,
+	}
 	if err := s.SaveTokens(ctx, late); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SaveTokens(ctx, early); err != nil {
 		t.Fatal(err)
 	}
-	var output int64
-	var observed int64
-	if err := s.db.QueryRow(`SELECT output_tokens, observed_at FROM token_usage WHERE message_id = ?`, "msg_1").Scan(&output, &observed); err != nil {
+	got, err := s.Usage(ctx, "claude", "msg_1")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if output != 120 {
-		t.Fatalf("output = %d", output)
+	if got.OutputTokens != 120 || got.Model != "full" || got.InputTokens != 50 || got.CacheCreationInputTokens != 100 || got.CacheReadInputTokens != 80 {
+		t.Fatalf("partial overwrote the row: %#v", got)
 	}
-	if observed != late.ObservedAt.UnixMilli() {
-		t.Fatalf("observed = %d", observed)
+	if !got.ObservedAt.Equal(late.ObservedAt) {
+		t.Fatalf("observed = %s", got.ObservedAt)
+	}
+	bigger := late
+	bigger.Model = "final"
+	bigger.OutputTokens = 200
+	bigger.InputTokens = 90
+	bigger.CacheCreationInputTokens = 7
+	bigger.CacheReadInputTokens = 8
+	bigger.ObservedAt = late.ObservedAt.Add(time.Second)
+	if err := s.SaveTokens(ctx, bigger); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.Usage(ctx, "claude", "msg_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OutputTokens != 200 || got.Model != "final" || got.InputTokens != 90 || got.CacheCreationInputTokens != 7 || got.CacheReadInputTokens != 8 {
+		t.Fatalf("larger row did not replace: %#v", got)
 	}
 }
 
 func TestCursorRoundTrip(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
-	off, err := s.Cursor(ctx, "codex", "abc")
-	if err != nil || off != 0 {
-		t.Fatalf("off=%d err=%v", off, err)
+	off, fileID, err := s.Cursor(ctx, "codex", "abc")
+	if err != nil || off != 0 || fileID != "" {
+		t.Fatalf("off=%d id=%q err=%v", off, fileID, err)
 	}
-	if err := s.SetCursor(ctx, "codex", "abc", 42); err != nil {
+	if err := s.SetCursor(ctx, "codex", "abc", 42, "9:8:7"); err != nil {
 		t.Fatal(err)
 	}
-	off, err = s.Cursor(ctx, "codex", "abc")
-	if err != nil || off != 42 {
-		t.Fatalf("off=%d err=%v", off, err)
+	off, fileID, err = s.Cursor(ctx, "codex", "abc")
+	if err != nil || off != 42 || fileID != "9:8:7" {
+		t.Fatalf("off=%d id=%q err=%v", off, fileID, err)
 	}
 }
 
@@ -170,6 +190,69 @@ func TestAlertDedupKey(t *testing.T) {
 	}
 	if len(other) != 0 {
 		t.Fatalf("other window = %#v", other)
+	}
+}
+
+func TestDBFilesArePrivate(t *testing.T) {
+	old := syscall.Umask(0)
+	t.Cleanup(func() { syscall.Umask(old) })
+	path := filepath.Join(t.TempDir(), "burnrate.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("%s mode = %o", p, info.Mode().Perm())
+		}
+	}
+}
+
+func TestShortBusyTimeoutDropsSample(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "burnrate.db")
+	hold, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hold.Close()
+	conn, err := hold.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), `BEGIN EXCLUSIVE`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(context.Background(), `ROLLBACK`)
+
+	start := time.Now()
+	other, err := OpenOptions(path, Options{BusyTimeout: StatuslineBusyTimeout})
+	if err != nil {
+		if time.Since(start) > 500*time.Millisecond {
+			t.Fatalf("open stalled %s: %v", time.Since(start), err)
+		}
+		return
+	}
+	defer other.Close()
+	start = time.Now()
+	err = other.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "claude", ObservedAt: time.Unix(1, 0).UTC(), Origin: "busy",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "five_hour", UsedPercent: 10, WindowMinutes: 300,
+			ResetsAt: time.Unix(2, 0).UTC(),
+		}},
+	})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected SQLITE_BUSY")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("write stalled %s: %v", elapsed, err)
 	}
 }
 

@@ -3,6 +3,7 @@ package analysis
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -76,13 +77,34 @@ func Evaluate(series provider.Series, now time.Time) View {
 		return view
 	}
 	hoursLeft := (100 - last.Used) / pace
-	hit := last.At.Add(time.Duration(hoursLeft * float64(time.Hour))).Round(time.Second)
-	if !series.ResetsAt.IsZero() && !hit.Before(series.ResetsAt) {
+	hit, okHit := addHours(last.At, hoursLeft)
+	if !okHit || (!series.ResetsAt.IsZero() && !hit.Before(series.ResetsAt)) {
 		view.Forecast = Forecast{Kind: KindAfterReset, PacePerHour: pace, HitAt: hit}
 		return view
 	}
 	view.Forecast = Forecast{Kind: KindHit, PacePerHour: pace, HitAt: hit}
 	return view
+}
+
+// addHours returns from+hours. A pace near zero can ask for a duration that
+// does not fit in time.Duration; that is not a hit time.
+func addHours(from time.Time, hours float64) (time.Time, bool) {
+	if math.IsNaN(hours) || math.IsInf(hours, 0) || hours < 0 {
+		return time.Time{}, false
+	}
+	maxHours := float64(math.MaxInt64) / float64(time.Hour) / 2
+	if hours > maxHours {
+		return time.Time{}, false
+	}
+	d := time.Duration(hours * float64(time.Hour))
+	if d < 0 {
+		return time.Time{}, false
+	}
+	hit := from.Add(d).Round(time.Second)
+	if hit.Before(from) {
+		return time.Time{}, false
+	}
+	return hit, true
 }
 
 // minPaceHours ignores spans shorter than a minute. A statusline refresh a

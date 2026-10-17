@@ -71,11 +71,24 @@ func logger() *log.Logger {
 	return log.New(os.Stderr, "burnrate: ", log.LstdFlags)
 }
 
+func loadConfig() (config.Config, string, error) {
+	path, err := config.DefaultConfigPath()
+	if err != nil {
+		return config.Config{}, "", err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return config.Config{}, path, err
+	}
+	return cfg, path, nil
+}
+
 func openApp() (config.Config, *store.Store, error) {
-	cfg, err := config.Load("")
+	cfg, cfgPath, err := loadConfig()
 	if err != nil {
 		return config.Config{}, nil, err
 	}
+	config.WarnConfigPerms(cfgPath, os.Stderr)
 	path, err := cfg.ResolvedDBPath()
 	if err != nil {
 		return config.Config{}, nil, err
@@ -92,7 +105,8 @@ func newAgent(cfg config.Config, st *store.Store, withTelegram bool) (*agent.Age
 	if err != nil {
 		return nil, err
 	}
-	collectors, err := agent.Collectors(cfg)
+	lg := logger()
+	collectors, err := agent.Collectors(cfg, lg)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +121,7 @@ func newAgent(cfg config.Config, st *store.Store, withTelegram bool) (*agent.Age
 		Thresholds: cfg.Alerts.Thresholds,
 		Location:   loc,
 		Interval:   interval,
-		Log:        logger(),
+		Log:        lg,
 	}
 	if withTelegram && cfg.TelegramConfigured() {
 		ag.Telegram = &telegram.Client{Token: cfg.Telegram.Token}
@@ -164,17 +178,18 @@ func cmdReport(forecast bool) int {
 }
 
 func cmdStatusline() int {
-	cfg, err := config.Load("")
+	cfg, cfgPath, err := loadConfig()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 		// Still try to run the wrapped command if we can see one. Without a
 		// config there is no command, so stop.
 		return 1
 	}
+	config.WarnConfigPerms(cfgPath, os.Stderr)
 	var save func(provider.Snapshot) error
 	if path, err := cfg.ResolvedDBPath(); err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
-	} else if st, err := store.Open(path); err != nil {
+	} else if st, err := store.OpenOptions(path, store.Options{BusyTimeout: store.StatuslineBusyTimeout}); err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 	} else {
 		defer st.Close()
@@ -211,10 +226,19 @@ func cmdInstall() int {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 		return 1
 	}
+	cfg, cfgPath, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
+		return 1
+	}
+	config.WarnConfigPerms(cfgPath, os.Stderr)
 	res, err := install.Install(install.Options{
-		Home:   home,
-		Exe:    exe,
-		Enable: true,
+		Home:          home,
+		Exe:           exe,
+		Enable:        true,
+		XDGConfigHome: os.Getenv("XDG_CONFIG_HOME"),
+		TelegramToken: cfg.Telegram.Token,
+		TelegramChat:  cfg.Telegram.ChatID,
 	})
 	if res.Path != "" {
 		fmt.Printf("wrote %s\n", res.Path)

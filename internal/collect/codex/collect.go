@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 // Collector scans ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
 type Collector struct {
 	Dir string
+	Log *log.Logger
 }
 
 // New returns a collector for a sessions directory.
@@ -23,6 +25,16 @@ func New(dir string) *Collector {
 }
 
 func (c *Collector) Name() string { return "codex" }
+
+func (c *Collector) logf(format string, args ...any) {
+	if c != nil && c.Log != nil {
+		c.Log.Printf(format, args...)
+	}
+}
+
+func isRollout(name string) bool {
+	return strings.HasPrefix(name, "rollout-") && strings.HasSuffix(name, ".jsonl")
+}
 
 // Collect reads new bytes from each rollout file. A missing directory is not
 // an error. Null-window snapshots are counted as skipped and not stored.
@@ -47,35 +59,44 @@ func (c *Collector) Collect(ctx context.Context, sink provider.Sink) (provider.S
 	}
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			c.logf("codex: %s: %v", path, walkErr)
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if d.IsDir() {
+		if d.IsDir() && !isRollout(d.Name()) {
 			return nil
 		}
-		name := d.Name()
-		if !strings.HasPrefix(name, "rollout-") || !strings.HasSuffix(name, ".jsonl") {
+		if !isRollout(d.Name()) {
 			return nil
 		}
 		stats.Files++
-		snaps, skipped, malformed, err := consumeFile(ctx, sink, path)
+		snaps, skipped, malformed, ferr := consumeFile(ctx, sink, path)
 		stats.Snapshots += snaps
 		stats.Skipped += skipped
 		stats.Malformed += malformed
-		return err
+		if ferr != nil {
+			c.logf("codex: %s: %v", path, ferr)
+		}
+		if d.IsDir() {
+			return fs.SkipDir
+		}
+		return nil
 	})
 	return stats, err
 }
 
 func consumeFile(ctx context.Context, sink provider.Sink, path string) (snaps, skipped, malformed int, err error) {
 	sourceKey := collect.Sum([]byte(path))
-	offset, err := sink.Cursor(ctx, "codex", sourceKey)
+	offset, fileID, err := sink.Cursor(ctx, "codex", sourceKey)
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	newOffset, err := collect.ReadNewLines(path, offset, func(line []byte) error {
+	newOffset, newID, err := collect.Tail(path, offset, fileID, func(line []byte) error {
 		switch res := ParseLine(line); res.Kind {
 		case KindSnapshot:
 			res.Snapshot.SourceKey = sourceKey
@@ -99,8 +120,8 @@ func consumeFile(ctx context.Context, sink provider.Sink, path string) (snaps, s
 		}
 		return nil
 	})
-	if newOffset != offset {
-		if cerr := sink.SetCursor(ctx, "codex", sourceKey, newOffset); cerr != nil && err == nil {
+	if newOffset != offset || newID != fileID {
+		if cerr := sink.SetCursor(ctx, "codex", sourceKey, newOffset, newID); cerr != nil && err == nil {
 			err = cerr
 		}
 	}

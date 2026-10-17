@@ -20,9 +20,10 @@ func Sum(b []byte) string {
 }
 
 // ReadNewLines calls yield for each complete line after offset.
-// A trailing partial line is left unconsumed so a writer can finish it.
-// A line longer than maxLine is skipped. If yield returns an error, the
-// returned offset does not include that line.
+// A trailing partial line is left unconsumed so a writer can finish it,
+// including a partial line that is already longer than maxLine.
+// A complete line longer than maxLine is skipped and consumed.
+// If yield returns an error, the returned offset does not include that line.
 func ReadNewLines(path string, offset int64, yield func([]byte) error) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -44,12 +45,15 @@ func ReadNewLines(path string, offset int64, yield func([]byte) error) (int64, e
 	br := bufio.NewReaderSize(f, 64*1024)
 	pos := offset
 	var pending []byte
+	var skipped int64
 	skipping := false
 
-	flushLine := func(line []byte) error {
-		if skipping || len(line) > maxLine {
+	consume := func(line []byte) error {
+		n := int64(len(line))
+		if skipping || skipped > 0 || len(line) > maxLine {
 			skipping = false
-			pos += int64(len(line))
+			pos += skipped + n
+			skipped = 0
 			return nil
 		}
 		trimmed := bytes.TrimRight(line, "\r\n")
@@ -60,15 +64,30 @@ func ReadNewLines(path string, offset int64, yield func([]byte) error) (int64, e
 				return err
 			}
 		}
-		pos += int64(len(line))
+		pos += n
 		return nil
 	}
 
 	for {
 		chunk := make([]byte, 64*1024)
 		n, rerr := br.Read(chunk)
-		if n > 0 {
-			pending = append(pending, chunk[:n]...)
+		data := chunk[:n]
+		for len(data) > 0 {
+			if skipping {
+				i := bytes.IndexByte(data, '\n')
+				if i < 0 {
+					skipped += int64(len(data))
+					break
+				}
+				skipped += int64(i + 1)
+				pos += skipped
+				skipped = 0
+				skipping = false
+				data = data[i+1:]
+				continue
+			}
+			pending = append(pending, data...)
+			data = nil
 			for {
 				i := bytes.IndexByte(pending, '\n')
 				if i < 0 {
@@ -77,21 +96,40 @@ func ReadNewLines(path string, offset int64, yield func([]byte) error) (int64, e
 				line := make([]byte, i+1)
 				copy(line, pending[:i+1])
 				pending = append([]byte(nil), pending[i+1:]...)
-				if err := flushLine(line); err != nil {
+				if err := consume(line); err != nil {
 					return pos, err
 				}
 			}
 			if len(pending) > maxLine {
-				pos += int64(len(pending))
+				skipped += int64(len(pending))
 				pending = nil
 				skipping = true
 			}
 		}
 		if rerr == io.EOF {
+			// skipped and pending are an unfinished line. Leave them unconsumed.
 			return pos, nil
 		}
 		if rerr != nil {
 			return pos, rerr
 		}
 	}
+}
+
+// Tail reads new lines and reports the file identity to store with the cursor.
+// A replaced file (new inode, shrink, or same-size rewrite) is read from the start.
+func Tail(path string, offset int64, fileID string, yield func([]byte) error) (int64, string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return offset, fileID, err
+	}
+	if CursorStale(fileID, info, offset) {
+		offset = 0
+	}
+	newOffset, err := ReadNewLines(path, offset, yield)
+	info2, serr := os.Stat(path)
+	if serr != nil {
+		return newOffset, fileID, err
+	}
+	return newOffset, FileID(info2), err
 }

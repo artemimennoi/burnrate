@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestReadNewLines(t *testing.T) {
@@ -117,6 +119,119 @@ func TestReadNewLinesFileShrinks(t *testing.T) {
 	}
 	if off != int64(len("short\n")) || len(got) != 1 || got[0] != "short" {
 		t.Fatalf("off=%d lines=%#v", off, got)
+	}
+}
+
+func TestReadNewLinesLeavesUnfinishedOversize(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.jsonl")
+	partial := bytes.Repeat([]byte("x"), maxLine+100)
+	if err := os.WriteFile(path, partial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	off, err := ReadNewLines(path, 0, func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != 0 || len(got) != 0 {
+		t.Fatalf("off=%d lines=%#v", off, got)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(append(bytes.Repeat([]byte("y"), 10), '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("keep\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = nil
+	off, err = ReadNewLines(path, off, func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "keep" {
+		t.Fatalf("lines = %#v", got)
+	}
+	if off != info.Size() {
+		t.Fatalf("offset = %d, size = %d", off, info.Size())
+	}
+}
+
+func TestCursorStaleAppendAndRewrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.jsonl")
+	if err := os.WriteFile(path, []byte("a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := FileID(info)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("b\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	grown, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if CursorStale(id, grown, int64(len("a\n"))) {
+		t.Fatal("append looked like a replacement")
+	}
+	if err := os.WriteFile(path, []byte("zz"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatal(err)
+	}
+	rewritten, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !CursorStale(id, rewritten, int64(len("a\n"))) {
+		t.Fatal("same-size rewrite was not detected")
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".burn", []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("longer line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replaced, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldIno := info.Sys().(*syscall.Stat_t).Ino
+	newIno := replaced.Sys().(*syscall.Stat_t).Ino
+	if oldIno == newIno {
+		t.Fatal("could not allocate a new inode for the replacement")
+	}
+	if !CursorStale(id, replaced, int64(len("a\n"))) {
+		t.Fatal("new inode was not detected")
 	}
 }
 

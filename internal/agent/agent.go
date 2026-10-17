@@ -31,21 +31,26 @@ type Agent struct {
 
 // Collectors builds the enabled collectors. Cursor and Grok stay disabled
 // unless the config opts in, and even then they do not perform network I/O.
-func Collectors(cfg config.Config) ([]provider.Collector, error) {
+// lg receives per-file read errors so one bad file does not stop the scan.
+func Collectors(cfg config.Config, lg *log.Logger) ([]provider.Collector, error) {
 	var out []provider.Collector
 	if cfg.Codex.Enabled {
 		dir, err := cfg.ResolvedSessionsDir()
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, codex.New(dir))
+		col := codex.New(dir)
+		col.Log = lg
+		out = append(out, col)
 	}
 	if cfg.Claude.Enabled {
 		dir, err := cfg.ResolvedProjectsDir()
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, claude.New(dir))
+		col := claude.New(dir)
+		col.Log = lg
+		out = append(out, col)
 	}
 	if cfg.Cursor.Enabled {
 		out = append(out, provider.Disabled{ID: "cursor"})

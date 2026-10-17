@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 // Collector scans ~/.claude/projects/**/*.jsonl for token usage.
 type Collector struct {
 	Dir string
+	Log *log.Logger
 }
 
 // New returns a transcript collector.
@@ -28,6 +30,12 @@ func New(dir string) *Collector {
 }
 
 func (c *Collector) Name() string { return "claude" }
+
+func (c *Collector) logf(format string, args ...any) {
+	if c != nil && c.Log != nil {
+		c.Log.Printf(format, args...)
+	}
+}
 
 // Collect reads new transcript bytes. A missing directory is not an error.
 func (c *Collector) Collect(ctx context.Context, sink provider.Sink) (provider.Stats, error) {
@@ -51,30 +59,43 @@ func (c *Collector) Collect(ctx context.Context, sink provider.Sink) (provider.S
 	}
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			c.logf("claude: %s: %v", path, walkErr)
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+		if d.IsDir() && !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}
 		stats.Files++
-		n, malformed, err := consumeTranscript(ctx, sink, path)
+		n, malformed, ferr := consumeTranscript(ctx, sink, path)
 		stats.Tokens += n
 		stats.Malformed += malformed
-		return err
+		if ferr != nil {
+			c.logf("claude: %s: %v", path, ferr)
+		}
+		if d.IsDir() {
+			return fs.SkipDir
+		}
+		return nil
 	})
 	return stats, err
 }
 
 func consumeTranscript(ctx context.Context, sink provider.Sink, path string) (tokens, malformed int, err error) {
 	sourceKey := collect.Sum([]byte(path))
-	offset, err := sink.Cursor(ctx, "claude", sourceKey)
+	offset, fileID, err := sink.Cursor(ctx, "claude", sourceKey)
 	if err != nil {
 		return 0, 0, err
 	}
-	newOffset, err := collect.ReadNewLines(path, offset, func(line []byte) error {
+	newOffset, newID, err := collect.Tail(path, offset, fileID, func(line []byte) error {
 		usage, ok := ParseUsage(line)
 		if !ok {
 			if len(line) > 0 && line[0] != '{' {
@@ -90,8 +111,8 @@ func consumeTranscript(ctx context.Context, sink provider.Sink, path string) (to
 		tokens++
 		return nil
 	})
-	if newOffset != offset {
-		if cerr := sink.SetCursor(ctx, "claude", sourceKey, newOffset); cerr != nil && err == nil {
+	if newOffset != offset || newID != fileID {
+		if cerr := sink.SetCursor(ctx, "claude", sourceKey, newOffset, newID); cerr != nil && err == nil {
 			err = cerr
 		}
 	}
@@ -113,9 +134,10 @@ type Options struct {
 	Save    func(provider.Snapshot) error
 }
 
-// Run reads the statusline JSON, records subscription windows, then runs the
-// user's previous statusline command with the original stdin and copies its
-// stdout. Recording errors are written to stderr and do not block the command.
+// Run reads the statusline JSON, starts the user's previous statusline command
+// immediately, then records subscription windows. The command's stdout is not
+// held behind the database write. Recording errors are written to stderr and
+// do not fail the command.
 func Run(opts Options) error {
 	if opts.Stdout == nil {
 		opts.Stdout = io.Discard
@@ -127,32 +149,55 @@ func Run(opts Options) error {
 	if err != nil {
 		return err
 	}
-	if opts.Save != nil && len(bytes.TrimSpace(raw)) > 0 {
-		observed := opts.Now
-		if observed.IsZero() {
-			observed = time.Now()
-		}
-		snap, perr := ParseStatusline(raw, observed)
-		if perr != nil {
-			fmt.Fprintf(opts.Stderr, "burnrate: statusline json: %v\n", perr)
-		} else if len(snap.Windows) > 0 {
-			snap.Origin = fmt.Sprintf("statusline:%d:%s", observed.UTC().UnixNano(), collect.Sum(raw))
-			if serr := opts.Save(snap); serr != nil {
-				fmt.Fprintf(opts.Stderr, "burnrate: record statusline: %v\n", serr)
-			}
-		}
+	cmd, startErr := startCommand(opts, raw)
+	recordStatusline(opts, raw)
+	if cmd == nil {
+		return startErr
 	}
+	waitErr := cmd.Wait()
+	if startErr != nil {
+		return startErr
+	}
+	return waitErr
+}
+
+func startCommand(opts Options, raw []byte) (*exec.Cmd, error) {
 	command := strings.TrimSpace(opts.Command)
 	if command == "" {
-		return nil
+		return nil, nil
 	}
 	if strings.Contains(command, "burnrate statusline") {
 		fmt.Fprintln(opts.Stderr, "burnrate: statusline_command must not invoke burnrate statusline")
-		return nil
+		return nil, nil
 	}
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Stdin = bytes.NewReader(raw)
 	cmd.Stdout = opts.Stdout
 	cmd.Stderr = opts.Stderr
-	return cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return cmd, nil
+}
+
+func recordStatusline(opts Options, raw []byte) {
+	if opts.Save == nil || len(bytes.TrimSpace(raw)) == 0 {
+		return
+	}
+	observed := opts.Now
+	if observed.IsZero() {
+		observed = time.Now()
+	}
+	snap, perr := ParseStatusline(raw, observed)
+	if perr != nil {
+		fmt.Fprintf(opts.Stderr, "burnrate: statusline json: %v\n", perr)
+		return
+	}
+	if len(snap.Windows) == 0 {
+		return
+	}
+	snap.Origin = fmt.Sprintf("statusline:%d:%s", observed.UTC().UnixNano(), collect.Sum(raw))
+	if serr := opts.Save(snap); serr != nil {
+		fmt.Fprintf(opts.Stderr, "burnrate: record statusline: %v\n", serr)
+	}
 }

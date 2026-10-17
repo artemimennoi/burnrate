@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -161,5 +163,97 @@ func TestStatuslinePipesAndRecords(t *testing.T) {
 	}
 	if !bytes.Equal(stdout.Bytes(), raw) {
 		t.Fatal("record error blocked the status line")
+	}
+}
+
+func TestStatuslineStartsCommandBeforeSave(t *testing.T) {
+	raw := []byte(`{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1792300000}}}`)
+	release := make(chan struct{})
+	saveEntered := make(chan struct{})
+	var once sync.Once
+	var mu sync.Mutex
+	var stdout bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(Options{
+			Stdin:   bytes.NewReader(raw),
+			Stdout:  lockedWriter{mu: &mu, w: &stdout},
+			Stderr:  io.Discard,
+			Command: "echo ready",
+			Now:     time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC),
+			Save: func(provider.Snapshot) error {
+				once.Do(func() { close(saveEntered) })
+				<-release
+				return nil
+			},
+		})
+	}()
+	select {
+	case <-saveEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("save was not called")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := stdout.String()
+		mu.Unlock()
+		if strings.Contains(got, "ready") {
+			close(release)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(release)
+	<-done
+	t.Fatal("command output did not appear while save was blocked")
+}
+
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
+
+func TestCollectContinuesAfterUnreadable(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"type":"assistant","timestamp":"2026-10-17T12:00:00Z","message":{"id":"msg_ok","model":"m","usage":{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}` + "\n"
+	if err := os.WriteFile(filepath.Join(root, "good.jsonl"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "bad.jsonl"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/no/such/transcript", filepath.Join(root, "missing.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	c := New(root)
+	c.Log = log.New(&logs, "", 0)
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	stats, err := c.Collect(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Tokens != 1 {
+		t.Fatalf("stats = %#v log=%s", stats, logs.String())
+	}
+	if !strings.Contains(logs.String(), "bad.jsonl") || !strings.Contains(logs.String(), "missing.jsonl") {
+		t.Fatalf("log = %s", logs.String())
 	}
 }

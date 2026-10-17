@@ -3,8 +3,10 @@ package codex
 import (
 	"bytes"
 	"context"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/artemimennoi/burnrate/internal/store"
@@ -99,6 +101,133 @@ func TestCollectSkipsPremiumAndResumes(t *testing.T) {
 	raw = append(raw, wal...)
 	if bytes.Contains(raw, []byte("SECRET_PATH_DO_NOT_STORE")) {
 		t.Fatal("database contains a file path")
+	}
+}
+
+func rolloutLine(ts string, pct int) string {
+	return `{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","plan_type":"plus","primary":{"used_percent":` + itoa(pct) + `,"window_minutes":300,"resets_at":1792300000},"secondary":null}}}` + "\n"
+}
+
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
+func TestCollectContinuesAfterUnreadable(t *testing.T) {
+	root := t.TempDir()
+	day := filepath.Join(root, "2026", "10", "17")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(day, "rollout-good.jsonl"), []byte(rolloutLine("2026-10-17T12:00:00Z", 62)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(day, "rollout-bad.jsonl"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/no/such/burnrate-rollout", filepath.Join(day, "rollout-missing.jsonl")); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	c := New(root)
+	c.Log = log.New(&logs, "", 0)
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	stats, err := c.Collect(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Snapshots != 1 {
+		t.Fatalf("stats = %#v log=%s", stats, logs.String())
+	}
+	if !strings.Contains(logs.String(), "rollout-bad.jsonl") || !strings.Contains(logs.String(), "rollout-missing.jsonl") {
+		t.Fatalf("log = %s", logs.String())
+	}
+	series, err := st.LatestSeries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var five float64
+	for _, s := range series {
+		if s.WindowKey == "5h" {
+			five = s.Samples[len(s.Samples)-1].Used
+		}
+	}
+	if five != 62 {
+		t.Fatalf("used = %v", five)
+	}
+}
+
+func TestCollectAppendAndReplacement(t *testing.T) {
+	root := t.TempDir()
+	day := filepath.Join(root, "2026", "10", "17")
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(day, "rollout-demo.jsonl")
+	if err := os.WriteFile(path, []byte(rolloutLine("2026-10-17T12:00:00Z", 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	c := New(root)
+	stats, err := c.Collect(context.Background(), st)
+	if err != nil || stats.Snapshots != 1 {
+		t.Fatalf("first stats=%#v err=%v", stats, err)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(rolloutLine("2026-10-17T12:05:00Z", 20)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	stats, err = c.Collect(context.Background(), st)
+	if err != nil || stats.Snapshots != 1 {
+		t.Fatalf("append stats=%#v err=%v", stats, err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".burn", []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replaced := rolloutLine("2026-10-17T13:00:00Z", 77) + rolloutLine("2026-10-17T13:01:00Z", 78)
+	if err := os.WriteFile(path, []byte(replaced), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stats, err = c.Collect(context.Background(), st)
+	if err != nil || stats.Snapshots != 2 {
+		t.Fatalf("replace stats=%#v err=%v", stats, err)
+	}
+	series, err := st.LatestSeries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var five float64
+	for _, s := range series {
+		if s.WindowKey == "5h" {
+			five = s.Samples[len(s.Samples)-1].Used
+		}
+	}
+	if five != 78 {
+		t.Fatalf("used = %v", five)
 	}
 }
 

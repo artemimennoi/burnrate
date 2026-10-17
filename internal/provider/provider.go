@@ -77,8 +77,8 @@ type Stats struct {
 type Sink interface {
 	SaveSnapshot(ctx context.Context, snap Snapshot) error
 	SaveTokens(ctx context.Context, usage TokenUsage) error
-	Cursor(ctx context.Context, providerName, sourceKey string) (int64, error)
-	SetCursor(ctx context.Context, providerName, sourceKey string, offset int64) error
+	Cursor(ctx context.Context, providerName, sourceKey string) (offset int64, fileID string, err error)
+	SetCursor(ctx context.Context, providerName, sourceKey string, offset int64, fileID string) error
 }
 
 // Collector scans a local source. Implementations must not read credentials.
