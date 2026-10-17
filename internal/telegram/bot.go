@@ -244,6 +244,9 @@ type Bot struct {
 	ChatID  int64
 	Handler Handler
 	Log     *log.Logger
+
+	logMu   sync.Mutex
+	lastLog map[string]time.Time
 }
 
 const helpText = "burnrate\n/status — current subscription windows\n/forecast — pace and when the limit will be hit"
@@ -299,16 +302,19 @@ func (b *Bot) Handle(ctx context.Context, u Update) error {
 	return b.Client.Send(ctx, b.ChatID, text)
 }
 
-func (b *Bot) logLimited(last *time.Time, format string, args ...any) {
-	if b == nil || b.Log == nil {
+func (b *Bot) logLimited(kind, format string, args ...any) {
+	if b == nil || b.Log == nil || kind == "" {
 		return
 	}
-	if last != nil && !last.IsZero() && time.Since(*last) < 30*time.Second {
+	b.logMu.Lock()
+	defer b.logMu.Unlock()
+	if b.lastLog == nil {
+		b.lastLog = map[string]time.Time{}
+	}
+	if last := b.lastLog[kind]; !last.IsZero() && time.Since(last) < 30*time.Second {
 		return
 	}
-	if last != nil {
-		*last = time.Now()
-	}
+	b.lastLog[kind] = time.Now()
 	b.Log.Printf(format, args...)
 }
 
@@ -317,7 +323,6 @@ func (b *Bot) logLimited(last *time.Time, format string, args ...any) {
 func (b *Bot) Run(ctx context.Context) error {
 	var offset int64
 	backoff := time.Second
-	var lastLog time.Time
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -327,7 +332,7 @@ func (b *Bot) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			b.logLimited(&lastLog, "telegram getUpdates: %v", err)
+			b.logLimited("getUpdates", "telegram getUpdates: %v", err)
 			timer := time.NewTimer(backoff)
 			select {
 			case <-ctx.Done():
@@ -346,7 +351,7 @@ func (b *Bot) Run(ctx context.Context) error {
 				offset = u.UpdateID + 1
 			}
 			if err := b.Handle(ctx, u); err != nil && ctx.Err() == nil {
-				b.logLimited(&lastLog, "telegram handle: %v", err)
+				b.logLimited("handle", "telegram handle: %v", err)
 			}
 		}
 	}

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -223,16 +225,16 @@ func (l lockedWriter) Write(p []byte) (int, error) {
 	return l.w.Write(p)
 }
 
-func TestStatuslineDepthStopsRecursion(t *testing.T) {
-	t.Setenv(StatuslineDepthEnv, "1")
+func TestStatuslineDepthWithoutAncestorStillRuns(t *testing.T) {
+	t.Setenv(StatuslineDepthEnv, "")
 	marker := filepath.Join(t.TempDir(), "ran")
-	var stdout bytes.Buffer
+	var stdout, stderr bytes.Buffer
 	saved := false
 	err := Run(Options{
 		Stdin:   bytes.NewReader([]byte(`{"rate_limits":{"five_hour":{"used_percentage":10,"resets_at":1792300000}}}`)),
 		Stdout:  &stdout,
-		Stderr:  &stdout,
-		Command: "touch " + marker,
+		Stderr:  &stderr,
+		Command: "touch " + marker + "; printf out",
 		Save: func(provider.Snapshot) error {
 			saved = true
 			return nil
@@ -241,11 +243,105 @@ func TestStatuslineDepthStopsRecursion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stdout.Len() != 0 || saved {
-		t.Fatalf("nested statusline printed %q saved %v", stdout.String(), saved)
+	if stdout.String() != "out" || !saved {
+		t.Fatalf("stdout %q saved %v", stdout.String(), saved)
 	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
-		t.Fatalf("nested command ran: %v", err)
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "ignoring") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestStatuslineAncestorStopsNested(t *testing.T) {
+	if StatuslineAncestor() {
+		t.Fatal("this test process is nested under statusline")
+	}
+	for _, mode := range []string{"parent", "unsets"} {
+		cmd := exec.Command(os.Args[0], "statusline")
+		cmd.Env = append(dropEnv(os.Environ(), "BURNRATE_ANCESTOR_MODE", StatuslineDepthEnv), "BURNRATE_ANCESTOR_MODE="+mode, StatuslineDepthEnv+"=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s: %v %s", mode, err, out)
+		}
+		if strings.TrimSpace(string(out)) != "nested" {
+			t.Fatalf("%s output = %q", mode, out)
+		}
+	}
+}
+
+func TestStatuslineCommandTimeoutKillsGroup(t *testing.T) {
+	old := statuslineTimeout
+	statuslineTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { statuslineTimeout = old })
+	start := time.Now()
+	err := Run(Options{
+		Stdin:   bytes.NewReader(nil),
+		Stdout:  io.Discard,
+		Stderr:  io.Discard,
+		Command: "sleep 30",
+	})
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("took %s", time.Since(start))
+	}
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatal(err)
+	}
+}
+
+func TestMain(m *testing.M) {
+	switch os.Getenv("BURNRATE_ANCESTOR_MODE") {
+	case "parent", "unsets":
+		runAncestorFixture()
+	default:
+		os.Exit(m.Run())
+	}
+}
+
+func runAncestorFixture() {
+	cmd := exec.Command(os.Args[0], "statusline")
+	env := dropEnv(os.Environ(), "BURNRATE_ANCESTOR_MODE", StatuslineDepthEnv)
+	if os.Getenv("BURNRATE_ANCESTOR_MODE") == "unsets" {
+		env = append(env, "BURNRATE_ANCESTOR_MODE=child")
+	} else {
+		env = append(env, "BURNRATE_ANCESTOR_MODE=child", StatuslineDepthEnv+"=1")
+	}
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "child: %v\n%s", err, out)
+		os.Exit(1)
+	}
+	fmt.Print(string(out))
+	os.Exit(0)
+}
+
+func dropEnv(env []string, names ...string) []string {
+	var out []string
+	for _, e := range env {
+		skip := false
+		for _, name := range names {
+			if e == name || strings.HasPrefix(e, name+"=") {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func init() {
+	if os.Getenv("BURNRATE_ANCESTOR_MODE") == "child" {
+		if StatuslineAncestor() {
+			fmt.Println("nested")
+		} else {
+			fmt.Println("not-nested")
+		}
+		os.Exit(0)
 	}
 }
 

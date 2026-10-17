@@ -182,3 +182,15 @@ func TestGetUpdatesBackoff(t *testing.T) {
 		t.Fatalf("logs not rate limited: %s", text)
 	}
 }
+
+func TestLogLimitedIsPerKind(t *testing.T) {
+	var logs strings.Builder
+	b := &Bot{Log: log.New(&logs, "", 0)}
+	b.logLimited("getUpdates", "telegram getUpdates: http 401")
+	b.logLimited("getUpdates", "telegram getUpdates: http 401")
+	b.logLimited("handle", "telegram handle: send failed")
+	text := logs.String()
+	if strings.Count(text, "getUpdates") != 1 || strings.Count(text, "handle") != 1 {
+		t.Fatalf("log = %s", text)
+	}
+}

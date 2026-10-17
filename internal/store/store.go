@@ -103,8 +103,10 @@ type Options struct {
 	// BusyTimeout is how long SQLite waits on a lock. Zero uses five seconds.
 	BusyTimeout time.Duration
 	// Retention drops snapshots and alerts older than this. Zero uses DefaultRetention.
-	// A negative value keeps every row.
+	// A negative value keeps every row. Prune runs only when the caller asks.
 	Retention time.Duration
+	// ReadOnly serves queries without a write lock. status and forecast use it.
+	ReadOnly bool
 }
 
 // Store is one process-local connection to the burnrate database.
@@ -120,19 +122,48 @@ func Open(path string) (*Store, error) {
 }
 
 // OpenOptions is Open with a caller-chosen busy timeout.
+// Prune is not run here. The agent deletes old rows on its own schedule.
+// ReadOnly opens an existing database without taking a write lock. A missing
+// file is created once, then reopened for reading, so a first status still
+// has a database to print from.
 func OpenOptions(path string, opts Options) (*Store, error) {
+	if opts.ReadOnly {
+		if _, err := os.Stat(path); err != nil {
+			if !os.IsNotExist(err) {
+				return nil, err
+			}
+			created, err := openWrite(path, opts)
+			if err != nil {
+				return nil, err
+			}
+			created.Close()
+		}
+		return openRead(path, opts)
+	}
+	return openWrite(path, opts)
+}
+
+func openWrite(path string, opts Options) (*Store, error) {
 	if err := writableDB(path); err != nil {
 		return nil, err
 	}
+	return openDB(path, opts, false)
+}
+
+func openRead(path string, opts Options) (*Store, error) {
+	return openDB(path, opts, true)
+}
+
+func openDB(path string, opts Options, readOnly bool) (*Store, error) {
 	busy := busyMillis(opts.BusyTimeout)
-	db, err := sql.Open("sqlite", sqliteDSN(path, busy))
+	db, err := sql.Open("sqlite", sqliteDSN(path, busy, readOnly))
 	if err != nil {
 		return nil, explainDB(path, err)
 	}
 	// More than one connection so a read can run while another statement is open.
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
-	if err := prepare(db, busy); err != nil {
+	if err := prepare(db, busy, readOnly); err != nil {
 		db.Close()
 		return nil, explainDB(path, err)
 	}
@@ -141,15 +172,14 @@ func OpenOptions(path string, opts Options) (*Store, error) {
 		retention = DefaultRetention
 	}
 	s := &Store{db: db, path: path, retention: retention}
+	if readOnly {
+		return s, nil
+	}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, explainDB(path, err)
 	}
 	if err := s.restrict(); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := s.Prune(context.Background()); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -208,16 +238,22 @@ func busyMillis(d time.Duration) int {
 	return ms
 }
 
-func sqliteDSN(path string, busyMS int) string {
+func sqliteDSN(path string, busyMS int, readOnly bool) string {
 	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
 	// RawQuery is copied as-is. Parentheses must stay literal for the driver.
+	if readOnly {
+		u.RawQuery = fmt.Sprintf("mode=ro&_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)", busyMS)
+		return u.String()
+	}
 	u.RawQuery = fmt.Sprintf("_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)", busyMS)
 	return u.String()
 }
 
-func prepare(db *sql.DB, busyMS int) error {
-	if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
-		return fmt.Errorf("journal_mode: %w", err)
+func prepare(db *sql.DB, busyMS int, readOnly bool) error {
+	if !readOnly {
+		if _, err := db.Exec("PRAGMA journal_mode = WAL"); err != nil {
+			return fmt.Errorf("journal_mode: %w", err)
+		}
 	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA busy_timeout = %d", busyMS)); err != nil {
 		return fmt.Errorf("busy_timeout: %w", err)
@@ -311,7 +347,8 @@ func (s *Store) Close() error {
 
 // SaveSnapshot inserts a snapshot. A repeated origin is ignored.
 // resets_at values within ResetSlack of a stored window reuse that window.
-// A snapshot whose windows match the latest one is not stored again.
+// A snapshot whose windows match the latest one updates that row's observed_at
+// instead of inserting another row, so the forecast sees the last observation.
 func (s *Store) SaveSnapshot(ctx context.Context, snap provider.Snapshot) error {
 	if snap.Provider == "" || snap.Origin == "" || snap.ObservedAt.IsZero() || len(snap.Windows) == 0 {
 		return fmt.Errorf("incomplete snapshot")
@@ -326,11 +363,20 @@ func (s *Store) SaveSnapshot(ctx context.Context, snap provider.Snapshot) error 
 	if err != nil {
 		return err
 	}
-	same, err := sameAsLatest(ctx, tx, snap.Provider, snap.LimitID, snap.PlanType, windows)
+	id, observedMS, same, err := sameAsLatest(ctx, tx, snap.Provider, snap.LimitID, snap.PlanType, windows)
 	if err != nil {
 		return err
 	}
 	if same {
+		if snap.ObservedAt.UnixMilli() > observedMS {
+			if _, err := tx.ExecContext(ctx, `UPDATE snapshots SET observed_at = ? WHERE id = ?`, snap.ObservedAt.UnixMilli(), id); err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+			return s.restrict()
+		}
 		return nil
 	}
 
@@ -355,7 +401,7 @@ func (s *Store) SaveSnapshot(ctx context.Context, snap provider.Snapshot) error 
 	if n == 0 {
 		return nil
 	}
-	id, err := res.LastInsertId()
+	id, err = res.LastInsertId()
 	if err != nil {
 		return err
 	}
@@ -406,28 +452,29 @@ func canonicalWindows(ctx context.Context, tx *sql.Tx, providerName, limitID str
 	return out, nil
 }
 
-func sameAsLatest(ctx context.Context, tx *sql.Tx, providerName, limitID, plan string, windows []provider.Window) (bool, error) {
+func sameAsLatest(ctx context.Context, tx *sql.Tx, providerName, limitID, plan string, windows []provider.Window) (int64, int64, bool, error) {
 	var id int64
+	var observed int64
 	var gotPlan string
 	err := tx.QueryRowContext(ctx, `
-		SELECT id, plan_type FROM snapshots
+		SELECT id, plan_type, observed_at FROM snapshots
 		WHERE provider = ? AND limit_id = ?
 		ORDER BY observed_at DESC, id DESC
-		LIMIT 1`, providerName, limitID).Scan(&id, &gotPlan)
+		LIMIT 1`, providerName, limitID).Scan(&id, &gotPlan, &observed)
 	if err == sql.ErrNoRows {
-		return false, nil
+		return 0, 0, false, nil
 	}
 	if err != nil {
-		return false, err
+		return 0, 0, false, err
 	}
 	if gotPlan != plan {
-		return false, nil
+		return 0, 0, false, nil
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT window_key, used_percent, window_minutes, resets_at
 		FROM snapshot_windows WHERE snapshot_id = ?`, id)
 	if err != nil {
-		return false, err
+		return 0, 0, false, err
 	}
 	defer rows.Close()
 	got := map[string]provider.Window{}
@@ -435,27 +482,27 @@ func sameAsLatest(ctx context.Context, tx *sql.Tx, providerName, limitID, plan s
 		var w provider.Window
 		var resets int64
 		if err := rows.Scan(&w.Key, &w.UsedPercent, &w.WindowMinutes, &resets); err != nil {
-			return false, err
+			return 0, 0, false, err
 		}
 		w.ResetsAt = time.Unix(resets, 0).UTC()
 		got[w.Key] = w
 	}
 	if err := rows.Err(); err != nil {
-		return false, err
+		return 0, 0, false, err
 	}
 	if len(got) != len(windows) {
-		return false, nil
+		return 0, 0, false, nil
 	}
 	for _, w := range windows {
 		prev, ok := got[w.Key]
 		if !ok || prev.WindowMinutes != w.WindowMinutes || prev.ResetsAt.Unix() != w.ResetsAt.Unix() {
-			return false, nil
+			return 0, 0, false, nil
 		}
 		if math.Abs(prev.UsedPercent-w.UsedPercent) > 1e-6 {
-			return false, nil
+			return 0, 0, false, nil
 		}
 	}
-	return true, nil
+	return id, observed, true, nil
 }
 
 // Prune deletes snapshots and alerts older than the retention window.

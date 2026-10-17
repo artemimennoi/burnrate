@@ -147,9 +147,10 @@ func writeEnvFile(path, token string, chat int64) (bool, error) {
 	return true, nil
 }
 
-// systemdPath escapes a path for EnvironmentFile=. Quotes are not used:
-// systemd keeps them as part of the path and then reports it is not absolute.
-// Spaces use the C escape systemd accepts, and % is doubled so it is not a specifier.
+// systemdPath prepares a path for EnvironmentFile=. The value is the raw
+// absolute path: spaces stay spaces. systemd v257 does not unescape \x20 in
+// config_parse_unit_env_file, so a hex escape is stored as part of the path
+// and the optional file is skipped. % is doubled so it is not a specifier.
 func systemdPath(path string) (string, error) {
 	if strings.ContainsAny(path, "\n\r") {
 		return "", fmt.Errorf("path cannot contain newlines")
@@ -157,30 +158,27 @@ func systemdPath(path string) (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", fmt.Errorf("path must be absolute")
 	}
-	var b strings.Builder
-	for _, r := range path {
-		switch r {
-		case ' ':
-			b.WriteString(`\x20`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '%':
-			b.WriteString(`%%`)
-		case '"':
-			b.WriteString(`\"`)
-		case '\'':
-			b.WriteString(`\'`)
-		case '\t':
-			b.WriteString(`\t`)
-		default:
-			if r < 0x20 || r == 0x7f {
-				fmt.Fprintf(&b, `\x%02x`, r)
-			} else {
-				b.WriteRune(r)
-			}
-		}
+	return strings.ReplaceAll(path, "%", "%%"), nil
+}
+
+// parseEnvironmentFileValue reads an EnvironmentFile= line the way systemd's
+// unit parser does: the value is the rest of the line, %% becomes %, and a
+// leading '-' marks the file optional. C escapes such as \x20 are not decoded.
+func parseEnvironmentFileValue(line string) (string, bool, error) {
+	const key = "EnvironmentFile="
+	if !strings.HasPrefix(line, key) {
+		return "", false, fmt.Errorf("not an EnvironmentFile assignment")
 	}
-	return b.String(), nil
+	v := strings.TrimSpace(strings.ReplaceAll(line[len(key):], "%%", "%"))
+	optional := false
+	if strings.HasPrefix(v, "-") {
+		optional = true
+		v = v[1:]
+	}
+	if !filepath.IsAbs(v) {
+		return "", optional, fmt.Errorf("path is not absolute")
+	}
+	return v, optional, nil
 }
 
 func quoteExec(path string) (string, error) {

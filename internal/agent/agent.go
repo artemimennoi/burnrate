@@ -29,8 +29,13 @@ type Agent struct {
 	Now        func() time.Time
 	Log        *log.Logger
 	logMu      sync.Mutex
-	lastLog    time.Time
+	lastLog    map[string]time.Time
+	lastPrune  time.Time
 }
+
+// pruneEvery is how often the agent deletes expired rows. status and forecast
+// do not prune.
+const pruneEvery = time.Hour
 
 // Collectors builds the enabled collectors. Cursor and Grok stay disabled
 // unless the config opts in, and even then they do not perform network I/O.
@@ -77,16 +82,19 @@ func (a *Agent) logf(format string, args ...any) {
 	}
 }
 
-func (a *Agent) logLimited(format string, args ...any) {
-	if a == nil || a.Log == nil {
+func (a *Agent) logLimited(kind, format string, args ...any) {
+	if a == nil || a.Log == nil || kind == "" {
 		return
 	}
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
-	if !a.lastLog.IsZero() && time.Since(a.lastLog) < 30*time.Second {
+	if a.lastLog == nil {
+		a.lastLog = map[string]time.Time{}
+	}
+	if last := a.lastLog[kind]; !last.IsZero() && time.Since(last) < 30*time.Second {
 		return
 	}
-	a.lastLog = time.Now()
+	a.lastLog[kind] = time.Now()
 	a.Log.Printf(format, args...)
 }
 
@@ -135,14 +143,26 @@ func (a *Agent) Scan(ctx context.Context) {
 }
 
 // Tick scans local sources and sends any new threshold alerts.
+// Expired rows are deleted at most once an hour.
 func (a *Agent) Tick(ctx context.Context) error {
-	if a.Store != nil {
-		if err := a.Store.Prune(ctx); err != nil {
-			a.logf("prune: %v", err)
-		}
-	}
+	a.maybePrune(ctx)
 	a.Scan(ctx)
 	return a.alert(ctx)
+}
+
+func (a *Agent) maybePrune(ctx context.Context) {
+	if a == nil || a.Store == nil {
+		return
+	}
+	now := a.now()
+	if !a.lastPrune.IsZero() && now.Sub(a.lastPrune) < pruneEvery {
+		return
+	}
+	if err := a.Store.Prune(ctx); err != nil {
+		a.logf("prune: %v", err)
+		return
+	}
+	a.lastPrune = now
 }
 
 func (a *Agent) alert(ctx context.Context) error {
@@ -177,7 +197,7 @@ func (a *Agent) alert(ctx context.Context) error {
 			continue
 		}
 		if !a.Telegram.AllowSend() {
-			a.logLimited("telegram send skipped during backoff")
+			a.logLimited("send", "telegram send skipped during backoff")
 			continue
 		}
 		jobs = append(jobs, job{view: v, pending: pending})
@@ -205,7 +225,7 @@ func (a *Agent) deliver(ctx context.Context, v analysis.View, pending []int) {
 	text := analysis.FormatAlert(v, th, a.Location)
 	if err := a.Telegram.Send(ctx, a.ChatID, text); err != nil {
 		a.Telegram.NoteFailure()
-		a.logLimited("telegram send failed: %v", err)
+		a.logLimited("send", "telegram send failed: %v", err)
 		return
 	}
 	a.Telegram.NoteSuccess()
@@ -224,7 +244,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		go func() {
 			bot := &telegram.Bot{Client: a.Telegram, ChatID: a.ChatID, Handler: a, Log: a.Log}
 			if err := bot.Run(ctx); err != nil && ctx.Err() == nil {
-				a.logLimited("telegram bot: %v", err)
+				a.logLimited("bot", "telegram bot: %v", err)
 			}
 		}()
 	} else {

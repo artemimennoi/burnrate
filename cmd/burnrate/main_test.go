@@ -1,11 +1,19 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/artemimennoi/burnrate/internal/store"
+	_ "modernc.org/sqlite"
 )
 
 func withStdio(t *testing.T, stdin string, fn func() int) (int, string, string) {
@@ -45,7 +53,15 @@ func quietEnv(t *testing.T) {
 	t.Setenv("BURNRATE_TELEGRAM_TOKEN", "")
 	t.Setenv("BURNRATE_TELEGRAM_CHAT_ID", "")
 	t.Setenv("BURNRATE_TIMEZONE", "")
-	t.Setenv("BURNRATE_STATUSLINE_DEPTH", "")
+	prev, had := os.LookupEnv("BURNRATE_STATUSLINE_DEPTH")
+	os.Unsetenv("BURNRATE_STATUSLINE_DEPTH")
+	t.Cleanup(func() {
+		if had {
+			os.Setenv("BURNRATE_STATUSLINE_DEPTH", prev)
+			return
+		}
+		os.Unsetenv("BURNRATE_STATUSLINE_DEPTH")
+	})
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -71,7 +87,7 @@ func TestStatuslineDegradesOnBrokenConfig(t *testing.T) {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "config.toml")
 	payload := "STATUSLINE_PAYLOAD"
-	if err := os.WriteFile(cfg, []byte("poll_interval = [\nstatusline_command = \"cat\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(cfg, []byte("poll_interval = [\n[claude]\nstatusline_command = \"cat\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("BURNRATE_CONFIG", cfg)
@@ -104,13 +120,66 @@ func TestStatuslineDegradesOnBrokenConfig(t *testing.T) {
 
 func TestStatuslineDepthExitsQuietly(t *testing.T) {
 	quietEnv(t)
-	t.Setenv("BURNRATE_STATUSLINE_DEPTH", "1")
+	t.Setenv("BURNRATE_STATUSLINE_DEPTH", "")
 	t.Setenv("BURNRATE_CONFIG", filepath.Join(t.TempDir(), "missing.toml"))
 	code, stdout, stderr := withStdio(t, "SECRET_STATUS", func() int {
 		return run([]string{"statusline"})
 	})
-	if code != 0 || stdout != "" || stderr != "" {
+	if code != 0 || stdout != "" || strings.Contains(stdout, "SECRET_STATUS") {
 		t.Fatalf("code %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "ignoring") {
+		t.Fatalf("stderr = %q", stderr)
+	}
+}
+
+func TestReportsAndStatuslineSurviveLockedDB(t *testing.T) {
+	quietEnv(t)
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "burnrate.db")
+	cfg := filepath.Join(dir, "config.toml")
+	body := "db_path = " + strconv.Quote(dbPath) + "\n[claude]\nenabled = false\nstatusline_command = \"printf hi\"\n[codex]\nenabled = false\n"
+	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BURNRATE_CONFIG", cfg)
+	created, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Close()
+
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}
+	u.RawQuery = "_pragma=busy_timeout(2000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(context.Background(), `ROLLBACK`)
+
+	start := time.Now()
+	code, stdout, stderr := withStdio(t, "", func() int { return run([]string{"status"}) })
+	if code != 0 || strings.Contains(stderr, "locked") || time.Since(start) > time.Second {
+		t.Fatalf("status code %d after %s stdout %q stderr %q", code, time.Since(start), stdout, stderr)
+	}
+	start = time.Now()
+	code, stdout, stderr = withStdio(t, "", func() int { return run([]string{"forecast"}) })
+	if code != 0 || strings.Contains(stderr, "locked") || time.Since(start) > time.Second {
+		t.Fatalf("forecast code %d after %s stdout %q stderr %q", code, time.Since(start), stdout, stderr)
+	}
+	start = time.Now()
+	code, stdout, stderr = withStdio(t, `{"rate_limits":{}}`, func() int { return run([]string{"statusline"}) })
+	if code != 0 || stdout != "hi" || time.Since(start) > time.Second {
+		t.Fatalf("statusline code %d after %s stdout %q stderr %q", code, time.Since(start), stdout, stderr)
 	}
 }
 

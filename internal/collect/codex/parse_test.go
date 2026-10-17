@@ -97,4 +97,8 @@ func TestParseRejectsWildPercents(t *testing.T) {
 	if low.Kind != KindSnapshot || len(low.Snapshot.Windows) != 1 || low.Snapshot.Windows[0].UsedPercent != 0 {
 		t.Fatalf("clamp low = %#v", low.Snapshot.Windows)
 	}
+	over := ParseLine([]byte(line("120")))
+	if over.Kind != KindSnapshot || len(over.Snapshot.Windows) != 1 || over.Snapshot.Windows[0].UsedPercent != 100 {
+		t.Fatalf("120 = %#v", over.Snapshot.Windows)
+	}
 }

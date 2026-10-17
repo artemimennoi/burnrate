@@ -114,13 +114,14 @@ func (e *NotImplementedError) Error() string {
 	return e.Provider + " collector is not implemented (phase 2, opt-in unofficial API)"
 }
 
-// CleanPercent accepts a used-percent sample. Values just outside 0..100 are
-// clamped. NaN, infinities, and values outside a small tolerance are rejected.
+// CleanPercent accepts a used-percent sample. Values just below 0 and values
+// above 100 up to 150 are clamped into 0..100. NaN, infinities, negatives
+// beyond a small tolerance, and absurd magnitudes are rejected.
 func CleanPercent(p float64) (float64, bool) {
 	if math.IsNaN(p) || math.IsInf(p, 0) {
 		return 0, false
 	}
-	if p < -1 || p > 101 {
+	if p < -1 || p > 150 {
 		return 0, false
 	}
 	if p < 0 {

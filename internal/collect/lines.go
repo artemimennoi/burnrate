@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"os"
 )
@@ -112,16 +113,18 @@ func readLines(path string, offset int64, includePartial bool, yield func([]byte
 		}
 		if rerr == io.EOF {
 			if includePartial && len(pending) > 0 && !skipping && len(pending) <= maxLine {
-				owned := make([]byte, len(pending))
-				copy(owned, pending)
-				trimmed := bytes.TrimRight(owned, "\r\n")
-				if len(trimmed) > 0 {
-					if err := yield(trimmed); err != nil {
+				trimmed := bytes.TrimSpace(pending)
+				// A file that stopped growing may end without a newline. Treat
+				// that tail as a line only when it is already valid JSON, so a
+				// prefix of a still-open line is left for the writer to finish.
+				if len(trimmed) > 0 && json.Valid(trimmed) {
+					owned := make([]byte, len(trimmed))
+					copy(owned, trimmed)
+					if err := yield(owned); err != nil {
 						return pos, err
 					}
+					pos += int64(len(pending))
 				}
-				pos += int64(len(pending))
-				return pos, nil
 			}
 			// A growing file's unfinished line stays unconsumed.
 			return pos, nil
@@ -143,9 +146,9 @@ func Tail(path string, offset int64, fileID string, yield func([]byte) error) (i
 		offset = 0
 		fileID = ""
 	}
-	// A file that has not changed since the last scan is done growing, so a
-	// final line without a newline is complete. A changed file keeps the
-	// partial unconsumed until a later scan sees it stay the same size.
+	// A file that has not changed since the last scan is done growing. A final
+	// line without a newline is then consumed only if it is valid JSON. A
+	// changed file, or an incomplete tail, stays unconsumed.
 	stable := fileID != "" && fileID == FileID(info) && offset < info.Size()
 	var newOffset int64
 	if stable {

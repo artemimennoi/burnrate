@@ -469,6 +469,76 @@ func TestUnwritableDBPath(t *testing.T) {
 	}
 }
 
+func TestOpenDoesNotPrune(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "burnrate.db")
+	s, err := OpenOptions(path, Options{Retention: 24 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour).UTC()
+	if err := s.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "codex", ObservedAt: old, LimitID: "codex", PlanType: "plus", Origin: "old",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "primary", UsedPercent: 10, WindowMinutes: 300, ResetsAt: old.Add(time.Hour),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	n, err := reopened.CountSnapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("open pruned snapshots, count = %d", n)
+	}
+}
+
+func TestReadOnlyDoesNotBlockOnWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "burnrate.db")
+	rw, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rw.Close()
+	conn, err := rw.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(context.Background(), `ROLLBACK`)
+
+	start := time.Now()
+	ro, err := OpenOptions(path, Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	if _, err := ro.CountSnapshots(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("read-only open blocked for %s", time.Since(start))
+	}
+	err = ro.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "codex", ObservedAt: time.Now().UTC(), LimitID: "codex", Origin: "ro",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "primary", UsedPercent: 1, WindowMinutes: 300, ResetsAt: time.Now().Add(time.Hour),
+		}},
+	})
+	if err == nil {
+		t.Fatal("read-only store wrote a snapshot")
+	}
+}
+
 func TestRejectEmptySnapshot(t *testing.T) {
 	s := openTest(t)
 	err := s.SaveSnapshot(context.Background(), provider.Snapshot{Provider: "codex"})

@@ -243,11 +243,34 @@ func TestSystemdEnvFileAllowsSpaces(t *testing.T) {
 	if strings.Contains(text, "123:SECRET") {
 		t.Fatalf("unit contains the token: %s", text)
 	}
-	if strings.Contains(text, `EnvironmentFile="`) || strings.Contains(text, `EnvironmentFile=-"`) {
-		t.Fatalf("quoted EnvironmentFile: %s", text)
+	if strings.Contains(text, `EnvironmentFile="`) || strings.Contains(text, `EnvironmentFile=-"`) || strings.Contains(text, `\x20`) {
+		t.Fatalf("EnvironmentFile is quoted or hex-escaped: %s", text)
 	}
-	if !strings.Contains(text, `\x20`) {
-		t.Fatalf("unit = %s", text)
+	var envLine string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "EnvironmentFile=") {
+			envLine = line
+		}
+	}
+	parsed, optional, err := parseEnvironmentFileValue(envLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(xdg, "burnrate", "telegram.env")
+	if !optional || parsed != envFile {
+		t.Fatalf("parsed %q optional %v, want %s", parsed, optional, envFile)
+	}
+	percent := "/tmp/a%b c"
+	escaped, err := systemdPath(percent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if escaped != "/tmp/a%%b c" {
+		t.Fatalf("escaped = %q", escaped)
+	}
+	back, optional, err := parseEnvironmentFileValue("EnvironmentFile=-" + escaped)
+	if err != nil || !optional || back != percent {
+		t.Fatalf("round trip %q %v %v", back, optional, err)
 	}
 	bin, err := exec.LookPath("systemd-analyze")
 	if err != nil {

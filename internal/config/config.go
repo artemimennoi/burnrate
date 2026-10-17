@@ -271,16 +271,25 @@ func (c Config) Retention() time.Duration {
 	return time.Duration(days) * 24 * time.Hour
 }
 
-// RecoverStatuslineCommand reads a statusline_command assignment from a config
-// file even when the rest of the file does not parse.
+// RecoverStatuslineCommand reads statusline_command from the [claude] table
+// even when the rest of the file does not parse. Assignments in other tables
+// are ignored.
 func RecoverStatuslineCommand(path string) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
+	section := ""
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		if section != "claude" {
 			continue
 		}
 		if !strings.HasPrefix(line, "statusline_command") {

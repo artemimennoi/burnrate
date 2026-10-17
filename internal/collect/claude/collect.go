@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/artemimennoi/burnrate/internal/collect"
@@ -125,9 +126,14 @@ func validJSON(line []byte) bool {
 	return json.Unmarshal(line, &v) == nil
 }
 
-// StatuslineDepthEnv is set on the wrapped command. A nested burnrate
-// statusline sees it, records nothing, and exits without printing.
+// StatuslineDepthEnv is set on the wrapped command. It is not a lock: a
+// statusline with no burnrate statusline ancestor ignores it. Nesting is
+// detected by walking parent processes.
 const StatuslineDepthEnv = "BURNRATE_STATUSLINE_DEPTH"
+
+// statuslineTimeout bounds the wrapped command. The process group is killed
+// when it expires so a stuck script cannot hold the status line open.
+var statuslineTimeout = 5 * time.Second
 
 // Options runs the statusline wrapper.
 type Options struct {
@@ -144,14 +150,15 @@ type Options struct {
 // held behind the database write. Recording errors are written to stderr and
 // do not fail the command.
 func Run(opts Options) error {
-	if os.Getenv(StatuslineDepthEnv) != "" {
-		return nil
-	}
-	if opts.Stdout == nil {
-		opts.Stdout = io.Discard
-	}
 	if opts.Stderr == nil {
 		opts.Stderr = io.Discard
+	}
+	if StatuslineAncestor() {
+		return nil
+	}
+	WarnIgnoredDepth(opts.Stderr)
+	if opts.Stdout == nil {
+		opts.Stdout = io.Discard
 	}
 	// The child process and recordStatusline both write stderr.
 	opts.Stderr = &syncWriter{w: opts.Stderr}
@@ -164,11 +171,46 @@ func Run(opts Options) error {
 	if cmd == nil {
 		return startErr
 	}
-	waitErr := cmd.Wait()
+	waitErr := waitCommand(cmd)
 	if startErr != nil {
 		return startErr
 	}
 	return waitErr
+}
+
+// WarnIgnoredDepth prints one line when BURNRATE_STATUSLINE_DEPTH is set on a
+// process that is not nested under statusline. The variable is then ignored.
+func WarnIgnoredDepth(w io.Writer) {
+	if w == nil {
+		return
+	}
+	if _, ok := os.LookupEnv(StatuslineDepthEnv); !ok {
+		return
+	}
+	fmt.Fprintf(w, "burnrate: %s is set but this process is not nested under statusline; ignoring it\n", StatuslineDepthEnv)
+}
+
+func waitCommand(cmd *exec.Cmd) error {
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(statuslineTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		killGroup(cmd)
+		<-done
+		return fmt.Errorf("statusline command timed out")
+	}
+}
+
+func killGroup(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	_ = cmd.Process.Kill()
 }
 
 type syncWriter struct {
@@ -192,6 +234,7 @@ func startCommand(opts Options, raw []byte) (*exec.Cmd, error) {
 	cmd.Stdout = opts.Stdout
 	cmd.Stderr = opts.Stderr
 	cmd.Env = withStatuslineDepth(os.Environ())
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}

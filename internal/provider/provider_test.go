@@ -52,6 +52,17 @@ func TestCleanPercent(t *testing.T) {
 	if !ok || got != 40 {
 		t.Fatalf("40 -> %v %v", got, ok)
 	}
+	got, ok = CleanPercent(120)
+	if !ok || got != 100 {
+		t.Fatalf("120 -> %v %v", got, ok)
+	}
+	got, ok = CleanPercent(150)
+	if !ok || got != 100 {
+		t.Fatalf("150 -> %v %v", got, ok)
+	}
+	if _, ok := CleanPercent(150.1); ok {
+		t.Fatal("accepted 150.1")
+	}
 }
 
 func TestDisabledDoesNoIO(t *testing.T) {

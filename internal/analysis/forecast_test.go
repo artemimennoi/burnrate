@@ -168,6 +168,46 @@ func TestFormatUsesTimezoneAndOmitsSecrets(t *testing.T) {
 	}
 }
 
+func TestPastHitIsNotShown(t *testing.T) {
+	now := time.Date(2026, 10, 17, 15, 0, 0, 0, time.UTC)
+	view := Evaluate(provider.Series{
+		Provider: "codex", LimitID: "codex", WindowKey: "5h", WindowMinutes: 300,
+		ResetsAt: now.Add(3 * time.Hour),
+		Samples: []provider.Sample{
+			{At: now.Add(-2 * time.Hour), Used: 10},
+			{At: now.Add(-90 * time.Minute), Used: 80},
+		},
+	}, now)
+	if view.Used >= 100 {
+		t.Fatalf("used = %v", view.Used)
+	}
+	if view.Forecast.Kind != KindUnknown {
+		t.Fatalf("kind = %v hit %s", view.Forecast.Kind, view.Forecast.HitAt)
+	}
+	text := FormatForecast([]View{view}, time.UTC)
+	if strings.Contains(text, "limit around") || !strings.Contains(text, "Pace unknown") {
+		t.Fatalf("forecast = %s", text)
+	}
+	alert := FormatAlert(view, 90, time.UTC)
+	if strings.Contains(alert, "limit around") || !strings.Contains(alert, "Pace unknown") {
+		t.Fatalf("alert = %s", alert)
+	}
+}
+
+func TestOverPercentIsAlreadyReached(t *testing.T) {
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	view := Evaluate(provider.Series{
+		Provider: "codex", WindowKey: "5h", ResetsAt: now.Add(time.Hour),
+		Samples: []provider.Sample{{At: now.Add(-time.Minute), Used: 100}},
+	}, now)
+	if view.Forecast.Kind != KindReached {
+		t.Fatalf("kind = %v", view.Forecast.Kind)
+	}
+	if !strings.Contains(FormatForecast([]View{view}, time.UTC), "Limit already reached") {
+		t.Fatal(FormatForecast([]View{view}, time.UTC))
+	}
+}
+
 func TestNegativePaceDoesNotPrintSignedZero(t *testing.T) {
 	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
 	view := Evaluate(provider.Series{

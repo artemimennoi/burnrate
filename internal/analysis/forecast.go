@@ -27,6 +27,8 @@ const (
 	KindReached
 	// KindStale means resets_at is in the past, so the percent is not current.
 	KindStale
+	// KindUnknown means a positive pace projects a hit time that is already past.
+	KindUnknown
 )
 
 // Forecast is the pace of one window.
@@ -78,6 +80,14 @@ func Evaluate(series provider.Series, now time.Time) View {
 	}
 	hoursLeft := (100 - last.Used) / pace
 	hit, okHit := addHours(last.At, hoursLeft)
+	if okHit && !hit.After(now) {
+		// The pace measured up to the latest sample already points at a time
+		// that has passed, and usage is still under 100%. Projecting that
+		// same pace forward from now is not evidence it continued, so the
+		// ETA is unknown rather than a clock time in the past.
+		view.Forecast = Forecast{Kind: KindUnknown, PacePerHour: pace}
+		return view
+	}
 	if !okHit || (!series.ResetsAt.IsZero() && !hit.Before(series.ResetsAt)) {
 		view.Forecast = Forecast{Kind: KindAfterReset, PacePerHour: pace, HitAt: hit}
 		return view
@@ -182,6 +192,8 @@ func forecastSentence(f Forecast, loc *time.Location) string {
 		return fmt.Sprintf("Pace %.1f%%/h, window resets before the limit.", formatPace(f.PacePerHour))
 	case KindHit:
 		return fmt.Sprintf("Pace %.1f%%/h, limit around %s.", formatPace(f.PacePerHour), formatTime(f.HitAt, loc))
+	case KindUnknown:
+		return "Pace unknown."
 	default:
 		return "Not enough samples to forecast."
 	}

@@ -257,22 +257,7 @@ func TestTailReadsStablePartialOnce(t *testing.T) {
 	}
 
 	got = nil
-	off, id, err = Tail(path, off, id, func(line []byte) error {
-		got = append(got, string(line))
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0] != "partial" {
-		t.Fatalf("second scan = %#v", got)
-	}
-	if off != int64(len(body)) {
-		t.Fatalf("offset = %d", off)
-	}
-
-	got = nil
-	off2, _, err := Tail(path, off, id, func(line []byte) error {
+	off2, id2, err := Tail(path, off, id, func(line []byte) error {
 		got = append(got, string(line))
 		return nil
 	})
@@ -280,7 +265,41 @@ func TestTailReadsStablePartialOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(got) != 0 || off2 != off {
-		t.Fatalf("third scan = %#v offset %d -> %d", got, off, off2)
+		t.Fatalf("incomplete tail was consumed: %#v offset %d -> %d", got, off, off2)
+	}
+	_ = id2
+}
+
+func TestTailConsumesValidJSONWithoutNewline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f.jsonl")
+	line := `{"used_percent":40}`
+	if err := os.WriteFile(path, []byte("full\n"+line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	off, id, err := Tail(path, 0, "", func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	off, id, err = Tail(path, off, id, func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != line {
+		t.Fatalf("json tail = %#v", got)
+	}
+	got = nil
+	if _, _, err := Tail(path, off, id, func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("counted again: %#v", got)
 	}
 }
 

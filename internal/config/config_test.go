@@ -180,12 +180,19 @@ func TestRetentionDefault(t *testing.T) {
 
 func TestRecoverStatuslineCommand(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "bad.toml")
-	body := "poll_interval = [\nstatusline_command = \"printf hi\"\n"
+	body := "poll_interval = [\nstatusline_command = \"printf no\"\n[codex]\nstatusline_command = \"printf also-no\"\n[claude]\nstatusline_command = \"printf hi\"\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if got := RecoverStatuslineCommand(path); got != "printf hi" {
 		t.Fatalf("recovered = %q", got)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.toml")
+	if err := os.WriteFile(outside, []byte("statusline_command = \"printf no\"\n[codex]\nstatusline_command = 'printf no'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := RecoverStatuslineCommand(outside); got != "" {
+		t.Fatalf("outside [claude] recovered %q", got)
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("broken config parsed")

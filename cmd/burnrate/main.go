@@ -112,7 +112,7 @@ func loadConfig() (config.Config, string, error) {
 	return cfg, path, nil
 }
 
-func openApp() (config.Config, *store.Store, error) {
+func openApp(readOnly bool) (config.Config, *store.Store, error) {
 	cfg, cfgPath, err := loadConfig()
 	if err != nil {
 		return config.Config{}, nil, err
@@ -122,7 +122,7 @@ func openApp() (config.Config, *store.Store, error) {
 	if err != nil {
 		return config.Config{}, nil, err
 	}
-	st, err := store.OpenOptions(path, store.Options{Retention: cfg.Retention()})
+	st, err := store.OpenOptions(path, store.Options{Retention: cfg.Retention(), ReadOnly: readOnly})
 	if err != nil {
 		return config.Config{}, nil, err
 	}
@@ -162,7 +162,7 @@ func cmdAgent(args []string) int {
 	if code, handled := parseArgs("agent", args); handled {
 		return code
 	}
-	cfg, st, err := openApp()
+	cfg, st, err := openApp(false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 		return 1
@@ -194,7 +194,7 @@ func cmdReport(args []string, forecast bool) int {
 	if code, handled := parseArgs(name, args); handled {
 		return code
 	}
-	cfg, st, err := openApp()
+	cfg, st, err := openApp(true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 		return 1
@@ -205,7 +205,6 @@ func cmdReport(args []string, forecast bool) int {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 		return 1
 	}
-	ag.Scan(context.Background())
 	var text string
 	if forecast {
 		text, err = ag.Forecast(context.Background())
@@ -221,7 +220,7 @@ func cmdReport(args []string, forecast bool) int {
 }
 
 func cmdStatusline(args []string) int {
-	if os.Getenv(claude.StatuslineDepthEnv) != "" {
+	if claude.StatuslineAncestor() {
 		return 0
 	}
 	if code, handled := parseArgs("statusline", args); handled {
@@ -233,9 +232,6 @@ func cmdStatusline(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "burnrate: %v\n", err)
 		command = config.RecoverStatuslineCommand(cfgPath)
-		if command == "" {
-			return 0
-		}
 	} else {
 		config.WarnConfigPerms(cfgPath, os.Stderr)
 		command = cfg.Claude.StatuslineCommand
