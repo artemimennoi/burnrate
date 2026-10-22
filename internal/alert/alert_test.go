@@ -31,3 +31,14 @@ func TestPendingThresholds(t *testing.T) {
 		t.Fatalf("new window = %#v", got)
 	}
 }
+
+func TestHighestThreshold(t *testing.T) {
+	got := Pending(92, []int{50, 75, 90}, nil, false)
+	th, ok := Highest(got)
+	if !ok || th != 90 {
+		t.Fatalf("highest = %d %v from %#v", th, ok, got)
+	}
+	if _, ok := Highest(nil); ok {
+		t.Fatal("empty pending")
+	}
+}

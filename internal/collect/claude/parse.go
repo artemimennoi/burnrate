@@ -71,10 +71,14 @@ func convertStatusWindow(raw *rateWindow, slot, key string, minutes int) (provid
 	if !ok {
 		return provider.Window{}, false
 	}
+	used, ok := provider.CleanPercent(*raw.UsedPercentage)
+	if !ok {
+		return provider.Window{}, false
+	}
 	return provider.Window{
 		Key:           key,
 		Slot:          slot,
-		UsedPercent:   *raw.UsedPercentage,
+		UsedPercent:   used,
 		WindowMinutes: minutes,
 		ResetsAt:      resets,
 	}, true
@@ -88,6 +92,10 @@ func convertSpend(raw *rateWindow) (provider.Window, bool) {
 	if !ok {
 		return provider.Window{}, false
 	}
+	used, ok := provider.CleanPercent(*raw.UsedPercentage)
+	if !ok {
+		return provider.Window{}, false
+	}
 	minutes := 0
 	switch raw.Period {
 	case "daily":
@@ -98,7 +106,7 @@ func convertSpend(raw *rateWindow) (provider.Window, bool) {
 	return provider.Window{
 		Key:           "spend",
 		Slot:          "spend_limit",
-		UsedPercent:   *raw.UsedPercentage,
+		UsedPercent:   used,
 		WindowMinutes: minutes,
 		ResetsAt:      resets,
 	}, true

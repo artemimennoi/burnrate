@@ -2,6 +2,7 @@ package provider
 
 import (
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -20,6 +21,47 @@ func TestWindowKey(t *testing.T) {
 		if got := WindowKey(tc.minutes); got != tc.want {
 			t.Fatalf("WindowKey(%d) = %q, want %q", tc.minutes, got, tc.want)
 		}
+	}
+}
+
+func TestCleanPercent(t *testing.T) {
+	if _, ok := CleanPercent(math.NaN()); ok {
+		t.Fatal("accepted NaN")
+	}
+	if _, ok := CleanPercent(math.Inf(1)); ok {
+		t.Fatal("accepted +Inf")
+	}
+	if _, ok := CleanPercent(math.Inf(-1)); ok {
+		t.Fatal("accepted -Inf")
+	}
+	if _, ok := CleanPercent(1e10); ok {
+		t.Fatal("accepted a huge percent")
+	}
+	if _, ok := CleanPercent(-50); ok {
+		t.Fatal("accepted -50")
+	}
+	got, ok := CleanPercent(100.4)
+	if !ok || got != 100 {
+		t.Fatalf("100.4 -> %v %v", got, ok)
+	}
+	got, ok = CleanPercent(-0.2)
+	if !ok || got != 0 {
+		t.Fatalf("-0.2 -> %v %v", got, ok)
+	}
+	got, ok = CleanPercent(40)
+	if !ok || got != 40 {
+		t.Fatalf("40 -> %v %v", got, ok)
+	}
+	got, ok = CleanPercent(120)
+	if !ok || got != 100 {
+		t.Fatalf("120 -> %v %v", got, ok)
+	}
+	got, ok = CleanPercent(150)
+	if !ok || got != 100 {
+		t.Fatalf("150 -> %v %v", got, ok)
+	}
+	if _, ok := CleanPercent(150.1); ok {
+		t.Fatal("accepted 150.1")
 	}
 }
 

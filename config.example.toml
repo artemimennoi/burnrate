@@ -5,8 +5,11 @@
 # IANA timezone for reset times. Empty uses the system zone.
 timezone = "Europe/Minsk"
 
-# How often the agent reads local logs.
+# How often the agent reads local logs. The agent requires at least 1s.
 poll_interval = "30s"
+
+# Days of snapshots and alerts to keep.
+retention_days = 90
 
 # Empty uses ~/.local/share/burnrate/burnrate.db (or $XDG_DATA_HOME/burnrate).
 db_path = ""

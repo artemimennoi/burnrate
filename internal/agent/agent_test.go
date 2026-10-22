@@ -13,9 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/artemimennoi/burnrate/internal/analysis"
 	"github.com/artemimennoi/burnrate/internal/collect/codex"
 	"github.com/artemimennoi/burnrate/internal/provider"
 	"github.com/artemimennoi/burnrate/internal/store"
@@ -77,16 +79,24 @@ func TestTickAlertsAndDedup(t *testing.T) {
 	mu.Lock()
 	got := append([]string(nil), sent...)
 	mu.Unlock()
-	if len(got) != 3 {
+	if len(got) != 1 {
 		t.Fatalf("alerts = %#v\nlog=%s", got, logs.String())
 	}
-	for i, th := range []string{"alert 50%", "alert 75%", "alert 90%"} {
-		if !strings.Contains(got[i], th) || !strings.Contains(got[i], "Codex (plus) 5h is at 92.0%") {
-			t.Fatalf("alert %d = %s", i, got[i])
-		}
-		if strings.Contains(got[i], "SECRET_PATH_DO_NOT_STORE") || strings.Contains(got[i], "premium") {
-			t.Fatalf("alert leaked data: %s", got[i])
-		}
+	if !strings.Contains(got[0], "alert 90%") || !strings.Contains(got[0], "Codex (plus) 5h is at 92.0%") {
+		t.Fatalf("alert = %s", got[0])
+	}
+	if strings.Contains(got[0], "alert 50%") || strings.Contains(got[0], "alert 75%") {
+		t.Fatalf("lower thresholds were sent: %s", got[0])
+	}
+	if strings.Contains(got[0], "SECRET_PATH_DO_NOT_STORE") || strings.Contains(got[0], "premium") {
+		t.Fatalf("alert leaked data: %s", got[0])
+	}
+	marked, err := st.SentThresholds(context.Background(), "codex", "codex", "5h", time.Date(2026, 10, 17, 16, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !marked[50] || !marked[75] || !marked[90] {
+		t.Fatalf("marked = %#v", marked)
 	}
 	status, err := ag.Status(context.Background())
 	if err != nil {
@@ -108,7 +118,7 @@ func TestTickAlertsAndDedup(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(sent) != 3 {
+	if len(sent) != 1 {
 		t.Fatalf("dedup failed, sent %d: %#v", len(sent), sent)
 	}
 }
@@ -180,6 +190,233 @@ func TestAlertLogRedactsTelegramToken(t *testing.T) {
 		t.Fatalf("log leaked token or url: %s", text)
 	}
 	if !strings.Contains(text, "telegram send failed") {
+		t.Fatalf("log = %s", text)
+	}
+}
+
+func TestTickSendStaysInsideInterval(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		time.Sleep(3 * time.Second)
+		io.Copy(io.Discard, r.Body)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	resets := time.Date(2026, 10, 17, 18, 0, 0, 0, time.UTC)
+	if err := st.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "codex", ObservedAt: resets.Add(-time.Hour), LimitID: "codex", PlanType: "plus",
+		Origin: "origin",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "primary", UsedPercent: 92, WindowMinutes: 300, ResetsAt: resets,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ag := &Agent{
+		Store: st,
+		Telegram: &telegram.Client{
+			Token:       "blocked-token",
+			BaseURL:     srv.URL,
+			SendTimeout: 5 * time.Second,
+		},
+		ChatID:     7,
+		Thresholds: []int{50, 75, 90},
+		Location:   time.UTC,
+		Interval:   200 * time.Millisecond,
+		Now:        func() time.Time { return resets.Add(-time.Hour) },
+		Log:        log.New(io.Discard, "", 0),
+	}
+	start := time.Now()
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if hits.Load() != 1 {
+		t.Fatalf("hits = %d", hits.Load())
+	}
+	if elapsed > time.Second || elapsed < 50*time.Millisecond {
+		t.Fatalf("tick took %s", elapsed)
+	}
+}
+
+func TestTickBackoffSkipsTelegram(t *testing.T) {
+	token := "401:TELEGRAMTOKENSECRET"
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	resets := time.Date(2026, 10, 17, 18, 0, 0, 0, time.UTC)
+	if err := st.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "codex", ObservedAt: resets.Add(-time.Hour), LimitID: "codex", PlanType: "plus",
+		Origin: "origin",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "primary", UsedPercent: 92, WindowMinutes: 300, ResetsAt: resets,
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	ag := &Agent{
+		Store:      st,
+		Telegram:   &telegram.Client{Token: token, BaseURL: srv.URL, SendTimeout: time.Second},
+		ChatID:     7,
+		Thresholds: []int{50, 75, 90},
+		Location:   time.UTC,
+		Interval:   time.Second,
+		Now:        func() time.Time { return resets.Add(-time.Hour) },
+		Log:        log.New(&logs, "", 0),
+	}
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("hits = %d, log = %s", hits.Load(), logs.String())
+	}
+	if strings.Contains(logs.String(), token) {
+		t.Fatalf("log leaked token: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "telegram send failed") {
+		t.Fatalf("log = %s", logs.String())
+	}
+}
+
+func TestRepeatedPercentUsesLastSeen(t *testing.T) {
+	now := time.Date(2026, 10, 17, 15, 0, 0, 0, time.UTC)
+	resets := now.Add(time.Hour)
+	st, err := store.Open(filepath.Join(t.TempDir(), "burnrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	save := func(at time.Time, used float64) {
+		t.Helper()
+		err := st.SaveSnapshot(context.Background(), provider.Snapshot{
+			Provider: "codex", ObservedAt: at, LimitID: "codex", PlanType: "plus",
+			Origin: at.Format(time.RFC3339Nano),
+			Windows: []provider.Window{{
+				Key: "5h", Slot: "primary", UsedPercent: used, WindowMinutes: 300, ResetsAt: resets,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	save(now.Add(-4*time.Hour), 10)
+	save(now.Add(-3*time.Hour), 30)
+	save(now.Add(-2*time.Hour), 30)
+	save(now.Add(-time.Hour), 30)
+	save(now.Add(-time.Minute), 30)
+	n, err := st.CountSnapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("rows = %d", n)
+	}
+	ag := &Agent{
+		Store:      st,
+		Location:   time.UTC,
+		Thresholds: []int{50, 75, 90},
+		Now:        func() time.Time { return now },
+	}
+	status, err := ag.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	forecast, err := ag.Forecast(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(forecast, "limit around") || !strings.Contains(forecast, "5.0%/h") || !strings.Contains(forecast, "window resets before the limit") {
+		t.Fatalf("forecast = %s", forecast)
+	}
+	if !strings.Contains(status, "14:59") || strings.Contains(status, "12:00") {
+		t.Fatalf("status = %s", status)
+	}
+	series, err := st.LatestSeries(context.Background())
+	if err != nil || len(series) != 1 {
+		t.Fatalf("series = %#v err %v", series, err)
+	}
+	view := analysis.Evaluate(series[0], now)
+	alert := analysis.FormatAlert(view, 50, time.UTC)
+	if strings.Contains(alert, "limit around") || !strings.Contains(alert, "5.0%/h") || !strings.Contains(alert, "window resets before the limit") {
+		t.Fatalf("alert = %s", alert)
+	}
+}
+
+func TestPruneRunsAboutHourly(t *testing.T) {
+	st, err := store.OpenOptions(filepath.Join(t.TempDir(), "burnrate.db"), store.Options{Retention: 24 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-48 * time.Hour)
+	save := func(origin string, at time.Time) {
+		t.Helper()
+		err := st.SaveSnapshot(context.Background(), provider.Snapshot{
+			Provider: "codex", ObservedAt: at, LimitID: "codex", PlanType: "plus", Origin: origin,
+			Windows: []provider.Window{{
+				Key: "5h", Slot: "primary", UsedPercent: 10, WindowMinutes: 300, ResetsAt: at.Add(time.Hour),
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	save("old", old)
+	ag := &Agent{Store: st, Now: func() time.Time { return now }, Log: log.New(io.Discard, "", 0)}
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	n, err := st.CountSnapshots(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("after first prune count = %d err %v", n, err)
+	}
+	save("old-again", old)
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	n, err = st.CountSnapshots(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("second tick pruned early, count = %d err %v", n, err)
+	}
+	ag.Now = func() time.Time { return now.Add(2 * time.Hour) }
+	if err := ag.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	n, err = st.CountSnapshots(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("hourly prune count = %d err %v", n, err)
+	}
+}
+
+func TestLogLimitedIsPerKind(t *testing.T) {
+	var logs strings.Builder
+	ag := &Agent{Log: log.New(&logs, "", 0)}
+	ag.logLimited("getUpdates", "telegram getUpdates: http 401")
+	ag.logLimited("getUpdates", "telegram getUpdates: http 401")
+	ag.logLimited("send", "telegram send failed: http 401")
+	text := logs.String()
+	if strings.Count(text, "getUpdates") != 1 || strings.Count(text, "send failed") != 1 {
 		t.Fatalf("log = %s", text)
 	}
 }

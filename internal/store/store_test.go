@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 3 {
+	if n != 4 {
 		t.Fatalf("versions = %d", n)
 	}
 	s.Close()
@@ -43,7 +44,7 @@ func TestMigrationsIdempotent(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 3 {
+	if n != 4 {
 		t.Fatalf("versions after reopen = %d", n)
 	}
 }
@@ -253,6 +254,341 @@ func TestShortBusyTimeoutDropsSample(t *testing.T) {
 	}
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("write stalled %s: %v", elapsed, err)
+	}
+}
+
+func TestResetJitterSharesWindow(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	base := time.Date(2026, 10, 17, 16, 0, 0, 0, time.UTC)
+	observed := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	save := func(origin string, used float64, resets time.Time) {
+		t.Helper()
+		err := s.SaveSnapshot(ctx, provider.Snapshot{
+			Provider: "codex", ObservedAt: observed, LimitID: "codex", PlanType: "plus", Origin: origin,
+			Windows: []provider.Window{{
+				Key: "5h", Slot: "primary", UsedPercent: used, WindowMinutes: 300, ResetsAt: resets,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	save("a", 40, base)
+	save("b", 40, base.Add(time.Second))
+	n, err := s.CountSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("jittered duplicate stored %d rows", n)
+	}
+	save("c", 92, base.Add(time.Second))
+	n, err = s.CountSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("changed percent stored %d rows", n)
+	}
+	rows, err := s.db.Query(`SELECT used_percent, resets_at FROM snapshot_windows ORDER BY used_percent`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got [][2]int64
+	for rows.Next() {
+		var used float64
+		var resets int64
+		if err := rows.Scan(&used, &resets); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, [2]int64{int64(used), resets})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0][0] != 40 || got[1][0] != 92 || got[0][1] != base.Unix() || got[1][1] != base.Unix() {
+		t.Fatalf("windows = %#v", got)
+	}
+	if err := s.MarkAlert(ctx, "codex", "codex", "5h", base, 90, 92, observed); err != nil {
+		t.Fatal(err)
+	}
+	sent, err := s.SentThresholds(ctx, "codex", "codex", "5h", base)
+	if err != nil || !sent[90] {
+		t.Fatalf("sent = %#v err %v", sent, err)
+	}
+
+	save("d", 92, base.Add(121*time.Second))
+	n, err = s.CountSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("window outside slack stored %d rows", n)
+	}
+}
+
+func TestDedupeRetentionAndIndexes(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	resets := time.Date(2026, 10, 17, 18, 0, 0, 0, time.UTC)
+	snap := provider.Snapshot{
+		Provider: "claude", ObservedAt: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC),
+		LimitID: "subscription", PlanType: "max", Origin: "one",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "five_hour", UsedPercent: 10, WindowMinutes: 300, ResetsAt: resets,
+		}},
+	}
+	if err := s.SaveSnapshot(ctx, snap); err != nil {
+		t.Fatal(err)
+	}
+	snap.Origin = "two"
+	snap.ObservedAt = snap.ObservedAt.Add(time.Minute)
+	if err := s.SaveSnapshot(ctx, snap); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.CountSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("identical consecutive snapshots = %d", n)
+	}
+	snap.Origin = "three"
+	snap.Windows[0].UsedPercent = 11
+	if err := s.SaveSnapshot(ctx, snap); err != nil {
+		t.Fatal(err)
+	}
+	n, err = s.CountSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("changed snapshot count = %d", n)
+	}
+
+	var indexes int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_snapshots_observed', 'idx_snapshots_provider_limit_time')`).Scan(&indexes); err != nil {
+		t.Fatal(err)
+	}
+	if indexes != 2 {
+		t.Fatalf("indexes = %d", indexes)
+	}
+
+	path := filepath.Join(t.TempDir(), "burnrate.db")
+	kept, err := OpenOptions(path, Options{Retention: 90 * 24 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kept.Close()
+	oldAt := time.Now().Add(-100 * 24 * time.Hour).UTC()
+	recentAt := time.Now().Add(-24 * time.Hour).UTC()
+	window := func(origin string, at time.Time) provider.Snapshot {
+		return provider.Snapshot{
+			Provider: "codex", ObservedAt: at, LimitID: "codex", PlanType: "plus", Origin: origin,
+			Windows: []provider.Window{{
+				Key: "7d", Slot: "secondary", UsedPercent: 20, WindowMinutes: 10080, ResetsAt: at.Add(24 * time.Hour),
+			}},
+		}
+	}
+	if err := kept.SaveSnapshot(ctx, window("old", oldAt)); err != nil {
+		t.Fatal(err)
+	}
+	if err := kept.SaveSnapshot(ctx, window("recent", recentAt)); err != nil {
+		t.Fatal(err)
+	}
+	if err := kept.MarkAlert(ctx, "codex", "codex", "7d", oldAt.Add(24*time.Hour), 50, 20, oldAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := kept.MarkAlert(ctx, "codex", "codex", "7d", recentAt.Add(24*time.Hour), 50, 20, recentAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := kept.Prune(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n, err = kept.CountSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("after prune snapshots = %d", n)
+	}
+	oldSent, err := kept.SentThresholds(ctx, "codex", "codex", "7d", oldAt.Add(24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldSent[50] {
+		t.Fatal("old alert was kept")
+	}
+	recentSent, err := kept.SentThresholds(ctx, "codex", "codex", "7d", recentAt.Add(24*time.Hour))
+	if err != nil || !recentSent[50] {
+		t.Fatalf("recent alert = %#v err %v", recentSent, err)
+	}
+
+	keepAll, err := OpenOptions(filepath.Join(t.TempDir(), "all.db"), Options{Retention: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer keepAll.Close()
+	if err := keepAll.SaveSnapshot(ctx, window("ancient", oldAt)); err != nil {
+		t.Fatal(err)
+	}
+	if err := keepAll.Prune(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n, err = keepAll.CountSnapshots(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("negative retention count = %d err %v", n, err)
+	}
+}
+
+func TestUnwritableDBPath(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(parent, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Open(filepath.Join(parent, "burnrate.db"))
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if strings.Contains(err.Error(), "out of memory") || strings.Contains(err.Error(), "(14)") {
+		t.Fatalf("misleading sqlite error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("err = %v", err)
+	}
+
+	dir := t.TempDir()
+	_, err = Open(dir)
+	if err == nil {
+		t.Fatal("expected error for a directory path")
+	}
+	if strings.Contains(err.Error(), "out of memory") || strings.Contains(err.Error(), "(14)") {
+		t.Fatalf("misleading sqlite error: %v", err)
+	}
+}
+
+func TestOpenDoesNotPrune(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "burnrate.db")
+	s, err := OpenOptions(path, Options{Retention: 24 * time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour).UTC()
+	if err := s.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "codex", ObservedAt: old, LimitID: "codex", PlanType: "plus", Origin: "old",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "primary", UsedPercent: 10, WindowMinutes: 300, ResetsAt: old.Add(time.Hour),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	n, err := reopened.CountSnapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("open pruned snapshots, count = %d", n)
+	}
+}
+
+func TestReadOnlyDoesNotBlockOnWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "burnrate.db")
+	rw, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rw.Close()
+	conn, err := rw.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(context.Background(), `BEGIN IMMEDIATE`); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(context.Background(), `ROLLBACK`)
+
+	start := time.Now()
+	ro, err := OpenOptions(path, Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	if _, err := ro.CountSnapshots(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("read-only open blocked for %s", time.Since(start))
+	}
+	err = ro.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "codex", ObservedAt: time.Now().UTC(), LimitID: "codex", Origin: "ro",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "primary", UsedPercent: 1, WindowMinutes: 300, ResetsAt: time.Now().Add(time.Hour),
+		}},
+	})
+	if err == nil {
+		t.Fatal("read-only store wrote a snapshot")
+	}
+}
+
+func TestReadOnlyImmutableWithoutWALSidecars(t *testing.T) {
+	srcPath := filepath.Join(t.TempDir(), "src.db")
+	src, err := Open(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Now().UTC().Truncate(time.Millisecond)
+	if err := src.SaveSnapshot(context.Background(), provider.Snapshot{
+		Provider: "codex", ObservedAt: observed, LimitID: "codex", PlanType: "plus", Origin: "immutable",
+		Windows: []provider.Window{{
+			Key: "5h", Slot: "primary", UsedPercent: 62, WindowMinutes: 300, ResetsAt: observed.Add(time.Hour),
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	src.Close()
+
+	dir := filepath.Join(t.TempDir(), "ro")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "burnrate.db")
+	body, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(dest + "-wal")
+	os.Remove(dest + "-shm")
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	ro, err := OpenOptions(dest, Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	n, err := ro.CountSnapshots(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("snapshots = %d", n)
 	}
 }
 

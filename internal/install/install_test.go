@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -39,6 +40,9 @@ func TestLinuxUnit(t *testing.T) {
 	if !strings.Contains(res.Note, "systemctl --user") {
 		t.Fatalf("note = %s", res.Note)
 	}
+	if strings.Contains(res.Note, "enable --now") || !strings.Contains(res.Note, "restart") {
+		t.Fatalf("note = %s", res.Note)
+	}
 }
 
 func TestDarwinPlistEscapesPath(t *testing.T) {
@@ -64,6 +68,9 @@ func TestDarwinPlistEscapesPath(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "Library", "Logs")); err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(res.Note, "bootout") || !strings.Contains(res.Note, "kickstart -k") {
+		t.Fatalf("note = %s", res.Note)
 	}
 }
 
@@ -177,6 +184,170 @@ func TestDarwinEnvFileNotInPlist(t *testing.T) {
 	}
 	if strings.TrimSpace(string(out)) != token+" 7 agent" {
 		t.Fatalf("script output = %q", out)
+	}
+}
+
+func TestReinstallDropsToken(t *testing.T) {
+	home := t.TempDir()
+	xdg := filepath.Join(t.TempDir(), "xdg")
+	opts := Options{
+		GOOS: "linux", Home: home, Exe: "/usr/local/bin/burnrate", Enable: false,
+		XDGConfigHome: xdg, TelegramToken: "123:SECRET", TelegramChat: 9,
+	}
+	if _, err := Install(opts); err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(xdg, "burnrate", "telegram.env")
+	body, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "BURNRATE_TELEGRAM_TOKEN=123:SECRET\n") {
+		t.Fatalf("env = %q", body)
+	}
+	opts.TelegramToken = ""
+	if _, err := Install(opts); err != nil {
+		t.Fatal(err)
+	}
+	body, err = os.ReadFile(envFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "SECRET") || !strings.Contains(string(body), "BURNRATE_TELEGRAM_CHAT_ID=9\n") {
+		t.Fatalf("env after refresh = %q", body)
+	}
+	opts.TelegramChat = 0
+	if _, err := Install(opts); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(envFile); !os.IsNotExist(err) {
+		t.Fatalf("telegram.env still present: %v", err)
+	}
+}
+
+func TestSystemdEnvFileAllowsSpaces(t *testing.T) {
+	home := t.TempDir()
+	xdg := filepath.Join(t.TempDir(), "x dg")
+	res, err := Install(Options{
+		GOOS: "linux", Home: home, Exe: "/usr/local/bin/burnrate", Enable: false,
+		XDGConfigHome: xdg, TelegramToken: "123:SECRET", TelegramChat: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(res.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if strings.Contains(text, "123:SECRET") {
+		t.Fatalf("unit contains the token: %s", text)
+	}
+	if strings.Contains(text, `EnvironmentFile="`) || strings.Contains(text, `EnvironmentFile=-"`) || strings.Contains(text, `\x20`) {
+		t.Fatalf("EnvironmentFile is quoted or hex-escaped: %s", text)
+	}
+	var envLine string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "EnvironmentFile=") {
+			envLine = line
+		}
+	}
+	parsed, optional, err := parseEnvironmentFileValue(envLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(xdg, "burnrate", "telegram.env")
+	if !optional || parsed != envFile {
+		t.Fatalf("parsed %q optional %v, want %s", parsed, optional, envFile)
+	}
+	percent := "/tmp/a%b c"
+	escaped, err := systemdPath(percent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if escaped != "/tmp/a%%b c" {
+		t.Fatalf("escaped = %q", escaped)
+	}
+	back, optional, err := parseEnvironmentFileValue("EnvironmentFile=-" + escaped)
+	if err != nil || !optional || back != percent {
+		t.Fatalf("round trip %q %v %v", back, optional, err)
+	}
+	bin, err := exec.LookPath("systemd-analyze")
+	if err != nil {
+		t.Skip("systemd-analyze not installed")
+	}
+	for _, args := range [][]string{
+		{bin, "verify", res.Path},
+		{bin, "--user", "verify", res.Path},
+	} {
+		out, _ := exec.Command(args[0], args[1:]...).CombinedOutput()
+		if strings.Contains(string(out), "not absolute") {
+			t.Fatalf("%v\n%s\nunit:\n%s", args, out, text)
+		}
+	}
+}
+
+func TestEnableRestartsLinuxService(t *testing.T) {
+	bin := t.TempDir()
+	logPath := filepath.Join(bin, "log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + strconv.Quote(logPath) + "\n"
+	if err := os.WriteFile(filepath.Join(bin, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	if err := enable("linux", filepath.Join(t.TempDir(), "burnrate.service")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if strings.Contains(text, "enable --now") || !strings.Contains(text, "--user restart burnrate.service") {
+		t.Fatalf("commands = %q", text)
+	}
+	if !strings.Contains(text, "--user enable burnrate.service") || !strings.Contains(text, "--user daemon-reload") {
+		t.Fatalf("commands = %q", text)
+	}
+}
+
+func TestEnableKickstartsDarwin(t *testing.T) {
+	bin := t.TempDir()
+	logPath := filepath.Join(bin, "log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + strconv.Quote(logPath) + "\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "launchctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin)
+	if err := enable("darwin", filepath.Join(t.TempDir(), "agent.plist")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(got)
+	if !strings.Contains(text, "bootout ") || !strings.Contains(text, "bootstrap ") || !strings.Contains(text, "kickstart -k ") {
+		t.Fatalf("commands = %q", text)
+	}
+
+	if err := os.WriteFile(logPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> " + strconv.Quote(logPath) + "\ncase \"$*\" in *bootstrap*) exit 1 ;; esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "launchctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := enable("darwin", filepath.Join(t.TempDir(), "agent.plist")); err != nil {
+		t.Fatal(err)
+	}
+	got, err = os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text = string(got)
+	if !strings.Contains(text, "bootout ") || !strings.Contains(text, "bootstrap ") || !strings.Contains(text, "kickstart -k ") {
+		t.Fatalf("reload commands = %q", text)
 	}
 }
 

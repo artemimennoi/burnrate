@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"os"
 )
@@ -25,6 +26,10 @@ func Sum(b []byte) string {
 // A complete line longer than maxLine is skipped and consumed.
 // If yield returns an error, the returned offset does not include that line.
 func ReadNewLines(path string, offset int64, yield func([]byte) error) (int64, error) {
+	return readLines(path, offset, false, yield)
+}
+
+func readLines(path string, offset int64, includePartial bool, yield func([]byte) error) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return offset, err
@@ -107,7 +112,21 @@ func ReadNewLines(path string, offset int64, yield func([]byte) error) (int64, e
 			}
 		}
 		if rerr == io.EOF {
-			// skipped and pending are an unfinished line. Leave them unconsumed.
+			if includePartial && len(pending) > 0 && !skipping && len(pending) <= maxLine {
+				trimmed := bytes.TrimSpace(pending)
+				// A file that stopped growing may end without a newline. Treat
+				// that tail as a line only when it is already valid JSON, so a
+				// prefix of a still-open line is left for the writer to finish.
+				if len(trimmed) > 0 && json.Valid(trimmed) {
+					owned := make([]byte, len(trimmed))
+					copy(owned, trimmed)
+					if err := yield(owned); err != nil {
+						return pos, err
+					}
+					pos += int64(len(pending))
+				}
+			}
+			// A growing file's unfinished line stays unconsumed.
 			return pos, nil
 		}
 		if rerr != nil {
@@ -125,8 +144,18 @@ func Tail(path string, offset int64, fileID string, yield func([]byte) error) (i
 	}
 	if CursorStale(fileID, info, offset) {
 		offset = 0
+		fileID = ""
 	}
-	newOffset, err := ReadNewLines(path, offset, yield)
+	// A file that has not changed since the last scan is done growing. A final
+	// line without a newline is then consumed only if it is valid JSON. A
+	// changed file, or an incomplete tail, stays unconsumed.
+	stable := fileID != "" && fileID == FileID(info) && offset < info.Size()
+	var newOffset int64
+	if stable {
+		newOffset, err = readLines(path, offset, true, yield)
+	} else {
+		newOffset, err = readLines(path, offset, false, yield)
+	}
 	info2, serr := os.Stat(path)
 	if serr != nil {
 		return newOffset, fileID, err

@@ -78,3 +78,27 @@ func TestParseFixture(t *testing.T) {
 		t.Fatalf("broken kind = %v", got)
 	}
 }
+
+func TestParseRejectsWildPercents(t *testing.T) {
+	line := func(pct string) string {
+		return `{"timestamp":"2026-10-17T12:00:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","plan_type":"plus","primary":{"used_percent":` + pct + `,"window_minutes":300,"resets_at":1792300000},"secondary":null}}}`
+	}
+	if got := ParseLine([]byte(line("1e10"))).Kind; got != KindSkipNull {
+		t.Fatalf("huge kind = %v", got)
+	}
+	if got := ParseLine([]byte(line("-50"))).Kind; got != KindSkipNull {
+		t.Fatalf("negative kind = %v", got)
+	}
+	high := ParseLine([]byte(line("100.4")))
+	if high.Kind != KindSnapshot || len(high.Snapshot.Windows) != 1 || high.Snapshot.Windows[0].UsedPercent != 100 {
+		t.Fatalf("clamp = %#v", high.Snapshot.Windows)
+	}
+	low := ParseLine([]byte(line("-0.2")))
+	if low.Kind != KindSnapshot || len(low.Snapshot.Windows) != 1 || low.Snapshot.Windows[0].UsedPercent != 0 {
+		t.Fatalf("clamp low = %#v", low.Snapshot.Windows)
+	}
+	over := ParseLine([]byte(line("120")))
+	if over.Kind != KindSnapshot || len(over.Snapshot.Windows) != 1 || over.Snapshot.Windows[0].UsedPercent != 100 {
+		t.Fatalf("120 = %#v", over.Snapshot.Windows)
+	}
+}

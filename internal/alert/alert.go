@@ -26,3 +26,12 @@ func Pending(used float64, thresholds []int, sent map[int]bool, stale bool) []in
 	sort.Ints(out)
 	return out
 }
+
+// Highest is the top pending threshold. A jump across several thresholds is
+// one message; the caller marks every pending threshold as sent.
+func Highest(pending []int) (int, bool) {
+	if len(pending) == 0 {
+		return 0, false
+	}
+	return pending[len(pending)-1], true
+}

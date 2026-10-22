@@ -1,7 +1,7 @@
 BINARY := bin/burnrate
 PKG := ./cmd/burnrate
 
-.PHONY: all build test vet ci clean
+.PHONY: all build test vet race ci clean
 
 all: build
 
@@ -11,10 +11,13 @@ build:
 test:
 	go test ./...
 
+race:
+	CGO_ENABLED=1 go test -race ./...
+
 vet:
 	go vet ./...
 
-ci: vet test build
+ci: vet test race build
 
 clean:
 	rm -rf bin

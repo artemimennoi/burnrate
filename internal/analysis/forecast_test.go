@@ -167,3 +167,79 @@ func TestFormatUsesTimezoneAndOmitsSecrets(t *testing.T) {
 		t.Fatal("empty report")
 	}
 }
+
+func TestPastHitIsNotShown(t *testing.T) {
+	now := time.Date(2026, 10, 17, 15, 0, 0, 0, time.UTC)
+	view := Evaluate(provider.Series{
+		Provider: "codex", LimitID: "codex", WindowKey: "5h", WindowMinutes: 300,
+		ResetsAt: now.Add(3 * time.Hour),
+		Samples: []provider.Sample{
+			{At: now.Add(-2 * time.Hour), Used: 10},
+			{At: now.Add(-90 * time.Minute), Used: 80},
+		},
+	}, now)
+	if view.Used >= 100 {
+		t.Fatalf("used = %v", view.Used)
+	}
+	if view.Forecast.Kind != KindUnknown {
+		t.Fatalf("kind = %v hit %s", view.Forecast.Kind, view.Forecast.HitAt)
+	}
+	text := FormatForecast([]View{view}, time.UTC)
+	if strings.Contains(text, "limit around") || !strings.Contains(text, "Pace unknown") {
+		t.Fatalf("forecast = %s", text)
+	}
+	alert := FormatAlert(view, 90, time.UTC)
+	if strings.Contains(alert, "limit around") || !strings.Contains(alert, "Pace unknown") {
+		t.Fatalf("alert = %s", alert)
+	}
+}
+
+func TestOverPercentIsAlreadyReached(t *testing.T) {
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	view := Evaluate(provider.Series{
+		Provider: "codex", WindowKey: "5h", ResetsAt: now.Add(time.Hour),
+		Samples: []provider.Sample{{At: now.Add(-time.Minute), Used: 100}},
+	}, now)
+	if view.Forecast.Kind != KindReached {
+		t.Fatalf("kind = %v", view.Forecast.Kind)
+	}
+	if !strings.Contains(FormatForecast([]View{view}, time.UTC), "Limit already reached") {
+		t.Fatal(FormatForecast([]View{view}, time.UTC))
+	}
+}
+
+func TestNegativePaceDoesNotPrintSignedZero(t *testing.T) {
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	view := Evaluate(provider.Series{
+		Provider: "codex", WindowKey: "5h", WindowMinutes: 300,
+		ResetsAt: now.Add(3 * time.Hour),
+		Samples: []provider.Sample{
+			{At: now.Add(-2 * time.Hour), Used: 40},
+			{At: now, Used: 39.99},
+		},
+	}, now)
+	if view.Forecast.PacePerHour >= 0 {
+		t.Fatalf("pace = %v", view.Forecast.PacePerHour)
+	}
+	text := FormatForecast([]View{view}, time.UTC)
+	if strings.Contains(text, "-0.0") {
+		t.Fatalf("forecast = %s", text)
+	}
+}
+
+func TestResetDateIncludesOtherYear(t *testing.T) {
+	resets := time.Date(2027, 1, 2, 15, 4, 0, 0, time.UTC)
+	view := View{
+		Series:   provider.Series{Provider: "codex", WindowKey: "5h", ResetsAt: resets},
+		Used:     10,
+		Observed: resets.Add(-time.Hour),
+		Forecast: Forecast{Kind: KindFlat},
+	}
+	text := FormatStatus([]View{view}, time.UTC)
+	if !strings.Contains(text, "2027") {
+		t.Fatalf("status = %s", text)
+	}
+	if strings.Contains(text, "2026") {
+		t.Fatalf("current year leaked into a 2027 reset: %s", text)
+	}
+}

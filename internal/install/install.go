@@ -102,7 +102,7 @@ func render(opts Options) (path, envFile, body string, err error) {
 		if err != nil {
 			return "", "", "", err
 		}
-		envLine, err := quoteExec(envFile)
+		envLine, err := systemdPath(envFile)
 		if err != nil {
 			return "", "", "", err
 		}
@@ -123,6 +123,9 @@ func render(opts Options) (path, envFile, body string, err error) {
 
 func writeEnvFile(path, token string, chat int64) (bool, error) {
 	if token == "" && chat == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
 		return false, nil
 	}
 	var b strings.Builder
@@ -142,6 +145,40 @@ func writeEnvFile(path, token string, chat int64) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// systemdPath prepares a path for EnvironmentFile=. The value is the raw
+// absolute path: spaces stay spaces. systemd v257 does not unescape \x20 in
+// config_parse_unit_env_file, so a hex escape is stored as part of the path
+// and the optional file is skipped. % is doubled so it is not a specifier.
+func systemdPath(path string) (string, error) {
+	if strings.ContainsAny(path, "\n\r") {
+		return "", fmt.Errorf("path cannot contain newlines")
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("path must be absolute")
+	}
+	return strings.ReplaceAll(path, "%", "%%"), nil
+}
+
+// parseEnvironmentFileValue reads an EnvironmentFile= line the way systemd's
+// unit parser does: the value is the rest of the line, %% becomes %, and a
+// leading '-' marks the file optional. C escapes such as \x20 are not decoded.
+func parseEnvironmentFileValue(line string) (string, bool, error) {
+	const key = "EnvironmentFile="
+	if !strings.HasPrefix(line, key) {
+		return "", false, fmt.Errorf("not an EnvironmentFile assignment")
+	}
+	v := strings.TrimSpace(strings.ReplaceAll(line[len(key):], "%%", "%"))
+	optional := false
+	if strings.HasPrefix(v, "-") {
+		optional = true
+		v = v[1:]
+	}
+	if !filepath.IsAbs(v) {
+		return "", optional, fmt.Errorf("path is not absolute")
+	}
+	return v, optional, nil
 }
 
 func quoteExec(path string) (string, error) {
@@ -215,9 +252,9 @@ func xmlEscape(s string) string {
 func manual(goos string) string {
 	switch goos {
 	case "linux":
-		return "systemctl --user daemon-reload && systemctl --user enable --now burnrate.service"
+		return "systemctl --user daemon-reload && systemctl --user enable burnrate.service && systemctl --user restart burnrate.service"
 	case "darwin":
-		return "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/" + label + ".plist"
+		return "launchctl bootout gui/$(id -u)/" + label + "; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/" + label + ".plist && launchctl kickstart -k gui/$(id -u)/" + label
 	default:
 		return ""
 	}
@@ -229,11 +266,14 @@ func enable(goos, unitPath string) error {
 		if _, err := exec.LookPath("systemctl"); err != nil {
 			return fmt.Errorf("systemctl not found; %s", manual(goos))
 		}
-		if out, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput(); err != nil {
-			return fmt.Errorf("systemctl daemon-reload: %s", strings.TrimSpace(string(out)))
-		}
-		if out, err := exec.Command("systemctl", "--user", "enable", "--now", "burnrate.service").CombinedOutput(); err != nil {
-			return fmt.Errorf("systemctl enable: %s", strings.TrimSpace(string(out)))
+		for _, args := range [][]string{
+			{"systemctl", "--user", "daemon-reload"},
+			{"systemctl", "--user", "enable", "burnrate.service"},
+			{"systemctl", "--user", "restart", "burnrate.service"},
+		} {
+			if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+				return fmt.Errorf("%s: %s", strings.Join(args, " "), strings.TrimSpace(string(out)))
+			}
 		}
 		return nil
 	case "darwin":
@@ -243,7 +283,18 @@ func enable(goos, unitPath string) error {
 		domain := "gui/" + strconv.Itoa(os.Getuid())
 		_ = exec.Command("launchctl", "bootout", domain+"/"+label).Run()
 		if out, err := exec.Command("launchctl", "bootstrap", domain, unitPath).CombinedOutput(); err != nil {
-			return fmt.Errorf("launchctl bootstrap: %s", strings.TrimSpace(string(out)))
+			// Already loaded: kickstart still restarts the job.
+			if out2, err2 := exec.Command("launchctl", "kickstart", "-k", domain+"/"+label).CombinedOutput(); err2 != nil {
+				msg := strings.TrimSpace(string(out))
+				if extra := strings.TrimSpace(string(out2)); extra != "" {
+					msg = msg + "; " + extra
+				}
+				return fmt.Errorf("launchctl bootstrap: %s", msg)
+			}
+			return nil
+		}
+		if out, err := exec.Command("launchctl", "kickstart", "-k", domain+"/"+label).CombinedOutput(); err != nil {
+			return fmt.Errorf("launchctl kickstart: %s", strings.TrimSpace(string(out)))
 		}
 		return nil
 	default:

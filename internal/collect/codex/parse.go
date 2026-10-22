@@ -112,10 +112,14 @@ func convertWindow(raw *rawWindow, slot string) (provider.Window, bool) {
 	if key == "" {
 		return provider.Window{}, false
 	}
+	used, ok := provider.CleanPercent(*raw.UsedPercent)
+	if !ok {
+		return provider.Window{}, false
+	}
 	return provider.Window{
 		Key:           key,
 		Slot:          slot,
-		UsedPercent:   *raw.UsedPercent,
+		UsedPercent:   used,
 		WindowMinutes: minutes,
 		ResetsAt:      time.Unix(int64(*raw.ResetsAt), 0).UTC(),
 	}, true

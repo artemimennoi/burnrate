@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -143,5 +145,52 @@ func TestSendTimeoutDoesNotCapLongPoll(t *testing.T) {
 	}
 	if time.Since(start) < 150*time.Millisecond {
 		t.Fatalf("getUpdates returned too fast: %s", time.Since(start))
+	}
+}
+
+func TestGetUpdatesBackoff(t *testing.T) {
+	token := "123456:SUPERSECRET"
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "nope", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	var logs strings.Builder
+	bot := &Bot{
+		Client: &Client{Token: token, BaseURL: srv.URL},
+		ChatID: 1,
+		Log:    log.New(&logs, "", 0),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3200*time.Millisecond)
+	defer cancel()
+	if err := bot.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	n := hits.Load()
+	if n < 2 || n > 5 {
+		t.Fatalf("requests = %d, log = %s", n, logs.String())
+	}
+	text := logs.String()
+	if strings.Contains(text, token) || strings.Contains(text, "http://") {
+		t.Fatalf("log leaked token or url: %s", text)
+	}
+	if !strings.Contains(text, "401") {
+		t.Fatalf("log = %s", text)
+	}
+	if strings.Count(text, "getUpdates") > 2 {
+		t.Fatalf("logs not rate limited: %s", text)
+	}
+}
+
+func TestLogLimitedIsPerKind(t *testing.T) {
+	var logs strings.Builder
+	b := &Bot{Log: log.New(&logs, "", 0)}
+	b.logLimited("getUpdates", "telegram getUpdates: http 401")
+	b.logLimited("getUpdates", "telegram getUpdates: http 401")
+	b.logLimited("handle", "telegram handle: send failed")
+	text := logs.String()
+	if strings.Count(text, "getUpdates") != 1 || strings.Count(text, "handle") != 1 {
+		t.Fatalf("log = %s", text)
 	}
 }

@@ -27,6 +27,8 @@ const (
 	KindReached
 	// KindStale means resets_at is in the past, so the percent is not current.
 	KindStale
+	// KindUnknown means a positive pace projects a hit time that is already past.
+	KindUnknown
 )
 
 // Forecast is the pace of one window.
@@ -78,6 +80,14 @@ func Evaluate(series provider.Series, now time.Time) View {
 	}
 	hoursLeft := (100 - last.Used) / pace
 	hit, okHit := addHours(last.At, hoursLeft)
+	if okHit && !hit.After(now) {
+		// The pace measured up to the latest sample already points at a time
+		// that has passed, and usage is still under 100%. Projecting that
+		// same pace forward from now is not evidence it continued, so the
+		// ETA is unknown rather than a clock time in the past.
+		view.Forecast = Forecast{Kind: KindUnknown, PacePerHour: pace}
+		return view
+	}
 	if !okHit || (!series.ResetsAt.IsZero() && !hit.Before(series.ResetsAt)) {
 		view.Forecast = Forecast{Kind: KindAfterReset, PacePerHour: pace, HitAt: hit}
 		return view
@@ -152,7 +162,19 @@ func formatTime(t time.Time, loc *time.Location) string {
 	if loc == nil {
 		loc = time.UTC
 	}
-	return t.In(loc).Format("Mon 2 Jan 15:04 MST")
+	tt := t.In(loc)
+	if tt.Year() != time.Now().In(loc).Year() {
+		return tt.Format("Mon 2 Jan 2006 15:04 MST")
+	}
+	return tt.Format("Mon 2 Jan 15:04 MST")
+}
+
+// formatPace hides a pace that prints as -0.0 or 0.0 at one decimal place.
+func formatPace(p float64) float64 {
+	if math.Abs(p) < 0.05 {
+		return 0
+	}
+	return p
 }
 
 func forecastSentence(f Forecast, loc *time.Location) string {
@@ -162,14 +184,16 @@ func forecastSentence(f Forecast, loc *time.Location) string {
 	case KindReached:
 		return "Limit already reached."
 	case KindFlat:
-		if f.PacePerHour < 0 {
-			return fmt.Sprintf("Pace %.1f%%/h, usage is falling.", f.PacePerHour)
+		if f.PacePerHour < 0 && math.Abs(f.PacePerHour) >= 0.05 {
+			return fmt.Sprintf("Pace %.1f%%/h, usage is falling.", formatPace(f.PacePerHour))
 		}
 		return "Pace flat, no hit at the current pace."
 	case KindAfterReset:
-		return fmt.Sprintf("Pace %.1f%%/h, window resets before the limit.", f.PacePerHour)
+		return fmt.Sprintf("Pace %.1f%%/h, window resets before the limit.", formatPace(f.PacePerHour))
 	case KindHit:
-		return fmt.Sprintf("Pace %.1f%%/h, limit around %s.", f.PacePerHour, formatTime(f.HitAt, loc))
+		return fmt.Sprintf("Pace %.1f%%/h, limit around %s.", formatPace(f.PacePerHour), formatTime(f.HitAt, loc))
+	case KindUnknown:
+		return "Pace unknown."
 	default:
 		return "Not enough samples to forecast."
 	}
